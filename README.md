@@ -7,7 +7,7 @@ The following sentence is from the Twitter sentiment dataset. I wouldn't say the
 
 (after preprocessing)				unable to access the website . will try again .
 
-(after unknown words are replaced w/ <unk>) 	<unk> to <unk> the <unk> . will try again .
+(after unknown words are replaced w/ \<unk>) 	\<unk> to \<unk> the \<unk> . will try again .
 
 <pre>
                                                                                    
