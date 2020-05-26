@@ -5,9 +5,10 @@ This parser learns grammar without ever needing to see an example of a syntax tr
 
 The following sentence is from the Twitter sentiment dataset. I wouldn't say the parse is exactly how I would do it, but the fact that the two clauses in the tweet are on separate branches and the verb phrase and noun phrase on the left branch are correctly separated makes this parser a promising candidate for general use in NLP.
 
-(after preprocessing)				unable to access the website . will try again . 
-(after unknown words are replaced w/ <unk>) 	<unk> to <unk> the <unk> . will try again . 
 <pre>
+(after preprocessing)				unable to access the website . will try again .
+(after unknown words are replaced w/ <unk>) 	<unk> to <unk> the <unk> . will try again .
+
                                                                                    
                       ___________________|______________________                    
                                                                                    
