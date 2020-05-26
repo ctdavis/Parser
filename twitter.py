@@ -42,14 +42,15 @@ config = {
     'limit': limit,
     'df': pd.read_csv('./data/Tweets.csv'),
     'anchor': 'text',
-    'sample_size': 1000,
+    'sample_size': 512,
+    'test_size': 64,
     'unify': ['text','airline_sentiment'],
     'sleep': 0.5,
     'reserve': { 'text' : ['negative','positive','neutral'] },
     'vars': {
         'text': {
             'preprocessor': preprocessor,
-            'limit': 2,
+            'limit': 1,
             'pad': True,
             'extra_fxns': {
                 'sizes': ('text', lambda context, x: len(x))
@@ -85,13 +86,17 @@ output_set = torch.LongTensor([
 PAD = 0
 SD = 1.
 
-si = partial(shuffle_indices, list(range(ds.sample_size))) # returns shuffled list of indices
+train_sample_size = ds.sample_size - config['test_size']
+
+si = partial(shuffle_indices, list(range(train_sample_size))) # returns shuffled list of indices
+tsi = partial(shuffle_indices, list(range(config['test_size'])))
 
 batch_size = 32
-n_epochs = 100
-n_batches = ds.sample_size // batch_size
-e = 128
-h = 128
+n_epochs = 200
+n_batches = train_sample_size // batch_size
+tn_batches = config['test_size'] // batch_size
+e = 512
+h = 512
 act = F.selu
 max_char_size = max(map(len, chain(*ds.vars['chars']['text'])))
 start_char_modelling_at = 0.0
@@ -109,12 +114,13 @@ model_config = {
     'pad': PAD,
     'sentiment': len(ds.vars['airline_sentiment']['vocab']),
     'limit': limit,
+    'dr': None, #0.1,
 }
 
 char_model_config = deepcopy(model_config)
-char_model_config.update({ 'wd': None, 'h': 64, 'adaptor': 128, 'has_subsequence': False, 'io': len(ds.vars['chars']['vocab']) })
+char_model_config.update({ 'wd': None, 'h': 64, 'adaptor': 256, 'has_subsequence': False, 'io': len(ds.vars['chars']['vocab']) })
 classifier_config = deepcopy(model_config)
-classifier_config.update({ 'io': 3, 'n_heads': 4 })
+classifier_config.update({ 'io': 3, 'n_heads': None })
 
 charE = Encoder(**char_model_config)
 E = Encoder(**model_config)
@@ -130,11 +136,12 @@ CL.apply(weight_init)
 
 C.V.weight.data = E.embed.weight
 
-optM = optim.AdamW(chain(E.parameters(), G.parameters(), charE.parameters(), C.parameters(), CL.parameters()))#, amsgrad=True)
+optM = optim.AdamW(chain(E.parameters(), G.parameters(), charE.parameters(), C.parameters(), CL.parameters()), amsgrad=True)
 
 for e in range(n_epochs):
 
     ixs = si()
+    tixs = tsi()
     epoch_gloss = 0.
     epoch_gacc = 0.
     epoch_depth_loss = 0.
@@ -218,6 +225,61 @@ for e in range(n_epochs):
     C.eval()
     CL.eval()
 
+    tgloss = 0.
+    tdepth_loss = 0.
+    tswd = 0.
+    tgacc = 0.
+    tcl_loss = 0.
+    tcl_acc = 0.
+
+    test_words_data = ds.preprocess_new_observations('text', ds.test_df.text)
+    test_chars_data = ds.preprocess_new_observations('chars', ds.test_df.text)
+    test_sentiment_data = ds.preprocess_new_observations('airline_sentiment', ds.test_df.airline_sentiment)
+
+    for ix, tb in enumerate(batch_indices(tixs, batch_size, tn_batches)): 
+
+        tsentiment_target = torch.cat([test_sentiment_data['target'][i] for i in tb])
+        test_words_targ = [
+            torch.cat([w.unsqueeze(0) if w != 1 else torch.LongTensor([ix+model_config['io']]) for ix,w in enumerate(t)])
+            for t in [test_words_data['vectors'][i] for i in tb]
+        ]
+        
+        test_chars = batch_data([torch.cat([charE(w.unsqueeze(1)) for w in s]) for s in [test_chars_data['vectors'][i] for i in tb]], PAD, limit, h)
+        test_words = batch_data(list([test_words_data['vectors'][i] for i in tb]), PAD, limit)
+        test_words_targ = batch_data(list(test_words_targ), PAD, limit)
+
+        test_features = E(test_words, test_chars)
+
+        test_trees = G(act(test_features.sum(0)), sizes=[limit] * len([test_words_data['sizes'][i] for i in tb]), return_trees=True)
+
+        tleaves, tdepths, tstates = zip(*[
+            (
+                G.get_leaves(t),
+                G.get_leaves(t,attr='depth'),
+                G.get_states(t).unsqueeze(1).mean(0)
+            )
+            for t in test_trees
+        ])
+
+        tsentiment, _ = CL([G.get_states(t).unsqueeze(1) for t in test_trees], act(E.embed(output_set)).unsqueeze(1))
+
+        tdepths = torch.cat([d.sum(0,keepdim=True) for d in tdepths]).squeeze(1)
+        tstates = torch.cat(tstates)
+
+        tleaves, test_words_targ = pad(define_padded_vectors(nn.utils.rnn.pad_sequence(tleaves), PAD), test_words_targ)
+        tleaves = C(tleaves, test_features, [limit]*batch_size)
+
+        tleaves = tleaves.view(tleaves.shape[0] * tleaves.shape[1], -1)
+        test_words_targ = test_words_targ.contiguous().view(-1)
+
+        tgloss += ce(tleaves, test_words_targ).item()
+        tdepth_loss += mse(tdepths, expected_depth([test_words_data['sizes'][i] for i in tb])).item()
+        tswd += sliced_wasserstein_distance(tstates).item()
+        tcl_loss += ce(tsentiment, tsentiment_target).item()
+        tgacc += (tleaves.log_softmax(-1).argmax(-1) == test_words_targ).long().float().mean().item()
+        tcl_acc += (tsentiment.softmax(-1).argmax(-1) == tsentiment_target).long().float().mean().item()
+
+
     features = E(T[:, :1], _Tchars[:, :1])
     trees = G(act(features.sum(0)), sizes=[limit], return_trees=True)
     leaves, _ = pad(G.get_leaves(trees[0]).unsqueeze(1), T[:,:1])
@@ -232,16 +294,17 @@ for e in range(n_epochs):
     print(f'GAcc: {round(epoch_gacc / n_batches, 3)}')
     print(f'ClLoss: {round(epoch_cl_loss / n_batches, 3)}')
     print(f'ClAcc: {round(epoch_cl_acc / n_batches, 3)}')
+    print(f'Test loss/depth/swd/acc/cl_acc: {", ".join(map(str, [round(tgloss / tn_batches, 3), round(tdepth_loss / tn_batches, 3), round(tswd / tn_batches, 3), round(tgacc / tn_batches, 3), round(tcl_acc / tn_batches, 3)]))}')
     print(f'Reconstruction of: {" ".join([w for w in ds.vars["text"]["text"][b[0]]])}')
     print(f'                   {" ".join([ds.vars["text"]["reverse_vocab"][w.item()] for w in T[:,0] if w.item() != 0])}')
     try:
-        inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, charE, 0, 'text',
-            ds.vars['chars']['text'][b[0]], CL, output_set, 'chars', sizes=sizes[:1])
-        #print_tree(
-        #    tree,
-        #    lambda x: x,
-        #    attr='attachment'
-        #)
+        #inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, charE, 0, 'text',
+        #    ds.vars['chars']['text'][b[0]], CL, output_set, 'chars', sizes=sizes[:1])
+        print_tree(
+            tree,
+            lambda x: x,
+            attr='attachment'
+        )
     except Exception as e:
         print(e)
     print()

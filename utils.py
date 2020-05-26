@@ -314,7 +314,7 @@ def inspect_parsed_sentence(s, ds, E, G, C, charE, ix, selector, aux=None, CL=No
         sents = {(len(V) - V[w] - 1): { 'sent': w } for w in ['negative','neutral','positive']}
         subtrees = {}
         for ix, ws in weights.items():
-            subtrees[sents[ix]['sent']] = set([subs[w] if type(subs[w]) is str else ' '.join(subs[w]) for w in ws])
+            subtrees[sents[ix]['sent']] = set([subs[w] if type(subs[w]) is str else ' '.join(subs[w]) for w in ([ws] if type(ws) is int else ws)])
     print()
     if print_s:
         print(s if type(s) is str else ' '.join(s))
@@ -382,7 +382,8 @@ class Dataset:
         self.anchor = anchor
         anchor_preprocessor = self.config['vars'][anchor]['preprocessor']
         limit = self.config['limit']
-        df = self.config['df']
+        df = self.config['df']#[:self.config['test_size']]
+        #self.test_df = self.config['df'][self.config['test_size']:]
         self.len_filter = (lambda x: len(anchor_preprocessor(x)) <= limit)
         if type(df) is str and df == 'random_wiki':
             self.citation_filter = (lambda x: not re.search(r'^(\[\d+\])+$', x))
@@ -398,6 +399,8 @@ class Dataset:
             df = pd.DataFrame({anchor: text})
         else:
             df = df[df[anchor].map(self.len_filter)].sample(self.sample_size).reset_index(drop=True)
+            self.test_df = df.iloc[-self.config['test_size']:]
+            df = df.iloc[:-self.config['test_size']]
         if self.unify or self.flatten:
             master = {}
             if self.flatten:

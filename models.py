@@ -202,6 +202,8 @@ class Generator(BatchGenerator):
         #self.gamma = nn.Linear(h, h)
         #self.beta = nn.Linear(h, h)
         self.film = tcnn.FiLM()
+        if kwargs.get('dr') is not None:
+            self.dropout = nn.AlphaDropout(kwargs['dr'])
 
     def generate(self, x, is_root=False, depth_cost=torch.FloatTensor([0.]), unk=1, *args, **kwargs):
         if is_root:
@@ -211,7 +213,8 @@ class Generator(BatchGenerator):
             _, gamma = self.gamma_branch(x).chunk(2, dim=1)
             _, beta = self.beta_branch(x).chunk(2, dim=1)
             x = self.act(self.film(self.global_state, gamma, beta))
-
+        if hasattr(self, 'dropout') and self.training:
+            x = self.dropout(x)
         has_branches = self.has_branches(x).sigmoid()
         if (has_branches.item() < .5) or (self.current_steps >= self.max_steps):
             return {
@@ -283,7 +286,10 @@ class Classifier(nn.Module):
         super(Classifier, self).__init__()
         self.io, self.h = kwargs['io'], kwargs['h']
         self.act = kwargs['act']
-        self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
+        if kwargs.get('n_heads') is not None:
+            self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
+        else:
+            self.A = Attention(self.h)
         self.C = nn.Linear(self.io * self.h, self.io)
     def forward(self, states, output_set):
         output, attn = zip(*[
