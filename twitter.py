@@ -118,7 +118,7 @@ model_config = {
 }
 
 char_model_config = deepcopy(model_config)
-char_model_config.update({ 'wd': None, 'h': 64, 'adaptor': 256, 'has_subsequence': False, 'io': len(ds.vars['chars']['vocab']) })
+char_model_config.update({ 'wd': None, 'h': 64, 'adaptor': h, 'has_subsequence': False, 'io': len(ds.vars['chars']['vocab']) })
 classifier_config = deepcopy(model_config)
 classifier_config.update({ 'io': 3, 'n_heads': None })
 
