@@ -274,7 +274,7 @@ class Encoder(nn.Module):
         if aux is None:
             features = (c2 + e).transpose(1,2).transpose(0,1)
             if hasattr(self, 'adaptor'):
-                features = self.adaptor(self.act(features).mean(0))
+                features = self.adaptor(self.act(features.mean(0)))
             else:
                 features = features#.sum(0)
         else:
@@ -307,7 +307,10 @@ class Copy(nn.Module):
         self.io, self.h = kwargs['io'], kwargs['h']
         self.act = kwargs['act']
         self.limit = kwargs['limit']
-        self.A = Attention(self.h)
+        if kwargs.get('n_heads') is not None:
+            self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
+        else:
+            self.A = Attention(self.h)
         self.V = nn.Linear(self.h, self.io)
         self.C = nn.Linear(self.h, self.limit)
     def forward(self, output, features, sizes):

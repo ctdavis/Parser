@@ -221,10 +221,11 @@ for e in range(n_epochs):
     #  output parsed training sentence  #
     #####################################
 
-    features = E(T[:, :1], _Tchars[:, :1])
-    trees = G(act(features.sum(0)), sizes=[limit], return_trees=True)
-    leaves, _ = pad(G.get_leaves(trees[0]).unsqueeze(1), T[:,:1])
-    leaves = C(leaves, features, sizes[:1])
+    if True: #random.choice([0, 1]):
+        features = E(T[:, :1], _Tchars[:, :1])
+        trees = G(act(features.sum(0)), sizes=[limit], return_trees=True)
+        leaves, _ = pad(G.get_leaves(trees[0]).unsqueeze(1), T[:,:1])
+        leaves = C(leaves, features, sizes[:1])
 
     tree = attach_to_leaves(trees[0], leaves, ds.vars['text'], model_config['io'], G, ds.vars['text']['text'][b[0]])
 

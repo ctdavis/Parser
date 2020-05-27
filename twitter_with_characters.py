@@ -57,15 +57,15 @@ config = {
                 'sizes': ('text', lambda context, x: len(x))
              },
         },
-        #'chars': {
-        #    'source': 'text',
-        #    'preprocessor': lambda x: list(map(list, preprocessor(x))),
-        #    'limit': 1,
-        #    'pad': True,
-        #    'extra_fxns': {
-        #        'sizes': ('text', lambda context, x: list(map(len, x)))
-        #    }
-        #},
+        'chars': {
+            'source': 'text',
+            'preprocessor': lambda x: list(map(list, preprocessor(x))),
+            'limit': 1,
+            'pad': True,
+            'extra_fxns': {
+                'sizes': ('text', lambda context, x: list(map(len, x)))
+            }
+        },
         'airline_sentiment': {
             'preprocessor': lambda x: [x],
             'limit': 0,
@@ -99,7 +99,7 @@ tn_batches = config['test_size'] // batch_size
 e = 128
 h = 128
 act = F.selu
-#max_char_size = max(map(len, chain(*ds.vars['chars']['text'])))
+max_char_size = max(map(len, chain(*ds.vars['chars']['text'])))
 start_char_modelling_at = 0.0
 
 ce = nn.CrossEntropyLoss()
@@ -119,20 +119,20 @@ model_config = {
     #'has_subsequence': True,
 }
 
-#char_model_config = deepcopy(model_config)
-#char_model_config.update({ 'wd': None, 'h': 64, 'adaptor': h, 'has_subsequence': False, 'io': len(ds.vars['chars']['vocab']) })
+char_model_config = deepcopy(model_config)
+char_model_config.update({ 'wd': None, 'h': 64, 'adaptor': h, 'has_subsequence': False, 'io': len(ds.vars['chars']['vocab']) })
 classifier_config = deepcopy(model_config)
 classifier_config.update({ 'io': 3, 'n_heads': 8 })
 copy_config = deepcopy(model_config)
 copy_config.update({ 'n_heads': None })
 
-#charE = Encoder(**char_model_config)
+charE = Encoder(**char_model_config)
 E = Encoder(**model_config)
 G = Generator(**model_config)
 C = Copy(**copy_config)
 CL = Classifier(**classifier_config)
 
-#charE.apply(weight_init)
+charE.apply(weight_init)
 E.apply(weight_init)
 G.apply(weight_init)
 C.apply(weight_init)
@@ -140,7 +140,7 @@ CL.apply(weight_init)
 
 C.V.weight.data = E.embed.weight
 
-optM = optim.AdamW(chain(E.parameters(), G.parameters(), C.parameters(), CL.parameters()), amsgrad=True)
+optM = optim.AdamW(chain(charE.parameters(), E.parameters(), G.parameters(), C.parameters(), CL.parameters()), amsgrad=True)
 
 for e in range(n_epochs):
 
@@ -161,10 +161,10 @@ for e in range(n_epochs):
 
     for ix, b in enumerate(batch_indices(ixs, batch_size, n_batches)): 
 
-        T, sizes, sentiment_target = zip(*[
+        T, Tchars, sizes, sentiment_target = zip(*[
             (
                 ds.vars['text']['vectors'][i],
-                #ds.vars['chars']['vectors'][i],
+                ds.vars['chars']['vectors'][i],
                 ds.vars['text']['sizes'][i],
                 ds.vars['airline_sentiment']['target'][i]
             )
@@ -175,13 +175,13 @@ for e in range(n_epochs):
         Targ = [torch.cat([w.unsqueeze(0) if w != 1 else torch.LongTensor([ix+model_config['io']]) for ix,w in enumerate(t)]) for t in T]
         sentiment_target = torch.cat(sentiment_target)
 
-        #_Tchars = batch_data([torch.cat([charE(w.unsqueeze(1)) for w in s]) for s in Tchars], PAD, limit, h)
+        _Tchars = batch_data([torch.cat([charE(w.unsqueeze(1)) for w in s]) for s in Tchars], PAD, limit, h)
         T = batch_data(list(T), PAD, limit)
         Targ = batch_data(list(Targ), PAD, limit)
 
         optM.zero_grad()
 
-        features = E(T)#, _Tchars)
+        features = E(T, _Tchars)
 
         trees = G(act(features.sum(0)), sizes=[limit] * len(sizes), return_trees=True) #sizes
 
@@ -237,7 +237,7 @@ for e in range(n_epochs):
     tcl_acc = 0.
 
     test_words_data = ds.preprocess_new_observations('text', ds.test_df.text)
-    #test_chars_data = ds.preprocess_new_observations('chars', ds.test_df.text)
+    test_chars_data = ds.preprocess_new_observations('chars', ds.test_df.text)
     test_sentiment_data = ds.preprocess_new_observations('airline_sentiment', ds.test_df.airline_sentiment)
 
     for ix, tb in enumerate(batch_indices(tixs, batch_size, tn_batches)): 
@@ -248,11 +248,11 @@ for e in range(n_epochs):
             for t in [test_words_data['vectors'][i] for i in tb]
         ]
         
-        #test_chars = batch_data([torch.cat([charE(w.unsqueeze(1)) for w in s]) for s in [test_chars_data['vectors'][i] for i in tb]], PAD, limit, h)
+        test_chars = batch_data([torch.cat([charE(w.unsqueeze(1)) for w in s]) for s in [test_chars_data['vectors'][i] for i in tb]], PAD, limit, h)
         test_words = batch_data(list([test_words_data['vectors'][i] for i in tb]), PAD, limit)
         test_words_targ = batch_data(list(test_words_targ), PAD, limit)
 
-        test_features = E(test_words)#, test_chars)
+        test_features = E(test_words, test_chars)
 
         test_trees = G(act(test_features.sum(0)), sizes=[limit] * len([test_words_data['sizes'][i] for i in tb]), return_trees=True)
         # [test_words_data['sizes'][i] for i in tb]
@@ -284,7 +284,7 @@ for e in range(n_epochs):
         tcl_acc += (tsentiment.softmax(-1).argmax(-1) == tsentiment_target).long().float().mean().item()
 
 
-    features = E(T[:, :1])#, _Tchars[:, :1])
+    features = E(T[:, :1], _Tchars[:, :1])
     trees = G(act(features.sum(0)), sizes=[limit], return_trees=True) # [limit]
     leaves, _ = pad(G.get_leaves(trees[0]).unsqueeze(1), T[:,:1])
     leaves = C(leaves, act(features), sizes[:1])

@@ -9,8 +9,7 @@ The following sentence is from the Twitter sentiment dataset. I wouldn't say the
 
 (after unknown words are replaced) \<unk> to \<unk> the \<unk> . will try again .
 
-<pre>
-                                                                                   
+<pre>                                                                               
                       ___________________|______________________                    
                                                                                    
            __________|____________                        ______|____________       
@@ -21,4 +20,20 @@ The following sentence is from the Twitter sentiment dataset. I wouldn't say the
 'unable' 'to'     'access' 'the'     'website' '.'     'will' 'try' 'again'     '.'
    |      |          |       |           |      |        |      |      |         |  
   ...    ...        ...     ...         ...    ...      ...    ...    ...       ...
+</pre>
+
+(after preprocessing) the magic eight ball has never steered me wrong :)
+(after unknown words are replaced) the \<unk> \<unk> \<unk> has never \<unk> me \<unk> :)
+
+<pre>                                                                                     
+                    _______________________|___________________                       
+                   |                                                                 
+                   |                               ____________|___________           
+                                                                           |         
+        ___________|___________             ______|_____                   |          
+                                           |                                         
+   ____|_____             _____|____       |       _____|______        ____|_____     
+'the'     'magic'     'eight'     'ball' 'has' 'never'     'steered' 'me'     'wrong'
+  |          |           |          |      |      |            |      |          |    
+ ...        ...         ...        ...    ...    ...          ...    ...        ...  
 </pre>
