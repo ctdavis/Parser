@@ -140,7 +140,7 @@ CL.apply(weight_init)
 
 C.V.weight.data = E.embed.weight
 
-optM = optim.AdamW(chain(charE.parameters(), E.parameters(), G.parameters(), C.parameters(), CL.parameters()), amsgrad=True)
+optM = optim.AdamW(chain(E.parameters(), G.parameters(), C.parameters(), CL.parameters()), amsgrad=True)
 
 for e in range(n_epochs):
 
@@ -181,7 +181,7 @@ for e in range(n_epochs):
 
         optM.zero_grad()
 
-        features = E(T, _Tchars)
+        features = E(T)#, _Tchars)
 
         trees = G(act(features.sum(0)), sizes=[limit] * len(sizes), return_trees=True) #sizes
 
@@ -252,7 +252,7 @@ for e in range(n_epochs):
         test_words = batch_data(list([test_words_data['vectors'][i] for i in tb]), PAD, limit)
         test_words_targ = batch_data(list(test_words_targ), PAD, limit)
 
-        test_features = E(test_words, test_chars)
+        test_features = E(test_words)#, test_chars)
 
         test_trees = G(act(test_features.sum(0)), sizes=[limit] * len([test_words_data['sizes'][i] for i in tb]), return_trees=True)
         # [test_words_data['sizes'][i] for i in tb]
@@ -284,7 +284,7 @@ for e in range(n_epochs):
         tcl_acc += (tsentiment.softmax(-1).argmax(-1) == tsentiment_target).long().float().mean().item()
 
 
-    features = E(T[:, :1], _Tchars[:, :1])
+    features = E(T[:, :1])#, _Tchars[:, :1])
     trees = G(act(features.sum(0)), sizes=[limit], return_trees=True) # [limit]
     leaves, _ = pad(G.get_leaves(trees[0]).unsqueeze(1), T[:,:1])
     leaves = C(leaves, act(features), sizes[:1])
@@ -302,13 +302,13 @@ for e in range(n_epochs):
     print(f'Reconstruction of: {" ".join([w for w in ds.vars["text"]["text"][b[0]]])}')
     print(f'                   {" ".join([ds.vars["text"]["reverse_vocab"][w.item()] for w in T[:,0] if w.item() != 0])}')
     try:
-        #inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, charE, 0, 'text',
-        #    ds.vars['chars']['text'][b[0]], CL, output_set, 'chars', sizes=sizes[:1])
-        print_tree(
-            tree,
-            lambda x: x,
-            attr='attachment'
-        )
+        inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, charE, 0, 'text',
+            ds.vars['chars']['text'][b[0]], CL, output_set, 'chars', sizes=sizes[:1])
+        #print_tree(
+        #    tree,
+        #    lambda x: x,
+        #    attr='attachment'
+        #)
     except Exception as e:
         print(e)
     print()
