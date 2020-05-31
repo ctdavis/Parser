@@ -40,4 +40,5 @@ The following sentences are from the Twitter sentiment dataset. As far as the fi
 </pre>
 
 \* a clause is a complete proposition - in English, at least a subject and a predicate, although colloquially it is sometimes grammatical to drop the subject, as is demonstrated here
+
 \*\* the left and right sides are actually all a VP with an object - in this case "the website"
