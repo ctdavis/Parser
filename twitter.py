@@ -111,7 +111,7 @@ model_config = {
     'batch': batch_size,
     'act': act,
     'preterminal': False,
-    'wd': .1,
+    'wd': .05,
     'pad': PAD,
     'sentiment': len(ds.vars['airline_sentiment']['vocab']),
     'limit': limit,

@@ -3,7 +3,7 @@ decoding using a set of fully connected layers that decide whether to branch at 
 
 This parser learns grammar without ever needing to see an example of a syntax tree (correct or otherwise) which makes it interesting for two main reasons: first, this detail fits an observation about human language learning which is that humans have consistent intuitions about compositional structure in language without necessarily being given explicit instruction on grammar; second, in practical applications where one might need access to explicit syntactic structure, there is no need to annotate data to achieve such a goal.
 
-The following sentences are from the Twitter sentiment dataset. As far as the first sentence, I wouldn't say the parse is exactly how I would do it, but the fact that the two clauses\* in the tweet are on separate branches and the verb phrase (VP) and noun phrase (NP) on the left branch are correctly separated\*\* makes this parser a promising candidate for general use in NLP.
+The following sentences are from the Twitter sentiment dataset. As far as the first sentence goes, I wouldn't say the parse is exactly how I would do it, but the fact that the two clauses\* in the tweet are on separate branches and the verb phrase (VP) and noun phrase (NP) on the left branch are correctly separated\*\* makes this parser a promising candidate for general use in NLP.
 
 (after preprocessing) unable to access the website . will try again .
 
