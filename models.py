@@ -199,8 +199,6 @@ class Generator(BatchGenerator):
         self.has_branches = nn.Linear(h, 1)
         self.gamma_branch = nn.Linear(h, h * 2)
         self.beta_branch = nn.Linear(h, h * 2)
-        #self.gamma = nn.Linear(h, h)
-        #self.beta = nn.Linear(h, h)
         self.film = tcnn.FiLM()
         if kwargs.get('dr') is not None:
             self.dropout = nn.AlphaDropout(kwargs['dr'])
@@ -209,9 +207,9 @@ class Generator(BatchGenerator):
         if is_root:
             self.global_state = x
             x = torch.zeros_like(self.global_state)
-            #gamma, beta = self.gamma(self.act(x)), self.beta(self.act(x))
-            _, gamma = self.gamma_branch(x).chunk(2, dim=1)
-            _, beta = self.beta_branch(x).chunk(2, dim=1)
+            #gamma, beta = self.condition(self.act(x)).chunk(2, dim=-1)#self.gamma(self.act(x)), self.beta(self.act(x))
+            _, gamma = self.act(self.gamma_branch(x)).chunk(2, dim=1)
+            _, beta = self.act(self.beta_branch(x)).chunk(2, dim=1)
             x = self.act(self.film(self.global_state, gamma, beta))
         if hasattr(self, 'dropout') and self.training:
             x = self.dropout(x)
@@ -226,13 +224,73 @@ class Generator(BatchGenerator):
             }
         else:
             self.current_steps += 2
-            #left, right = self.branch(x).chunk(2, dim=1)
-            left_gamma, right_gamma = self.gamma_branch(x).chunk(2, dim=1)
-            left_beta, right_beta = self.beta_branch(x).chunk(2, dim=1)
-            #left_gamma, left_beta = self.gamma(self.act(left)), self.beta(self.act(left))
-            #right_gamma, right_beta = self.gamma(self.act(right)), self.beta(self.act(right))
+            left_gamma, right_gamma = self.act(self.gamma_branch(x)).chunk(2, dim=1)
+            left_beta, right_beta = self.act(self.beta_branch(x)).chunk(2, dim=1)
             left = self.act(self.film(self.global_state, left_gamma, left_beta))
             right = self.act(self.film(self.global_state, right_gamma, right_beta))
+            if random.choice([True, False]):
+                left_branch = self.generate(left, depth_cost=depth_cost+has_branches, *args, **kwargs)
+                right_branch = self.generate(right, depth_cost=depth_cost+has_branches, *args, **kwargs)
+            else:
+                right_branch = self.generate(right, depth_cost=depth_cost+has_branches, *args, **kwargs)
+                left_branch = self.generate(left, depth_cost=depth_cost+has_branches, *args, **kwargs)
+            return {
+                'state': x,
+                'left': left_branch,
+                'right': right_branch,
+            }
+
+class ResidualGenerator(BatchGenerator):
+    def __init__(self, *args, **kwargs):
+        super(ResidualGenerator, self).__init__(*args, **kwargs)
+        o, h = kwargs['io'], kwargs['h']
+        self.act = kwargs['act']
+        self.o = o
+        self.h = h
+        self.has_branches = nn.Linear(h, 1)
+        self.hidden = nn.Linear(h, h)
+        #self.gamma_branch = nn.Linear(h, h * 2)
+        #self.beta_branch = nn.Linear(h, h * 2)
+
+        #self.gamma = nn.Linear(h, h)
+        #self.beta = nn.Linear(h, h)
+        #self.condition = nn.Linear(h, h * 2)
+        self.branch = nn.Linear(h, h * 2)
+
+        #self.film = tcnn.FiLM()
+        if kwargs.get('dr') is not None:
+            self.dropout = nn.AlphaDropout(kwargs['dr'])
+
+    def generate(self, x, is_root=False, depth_cost=torch.FloatTensor([0.]), unk=1, *args, **kwargs):
+        #if is_root:
+        #    self.global_state = x
+        #    x = torch.zeros_like(self.global_state)
+        #    #gamma, beta = self.condition(self.act(x)).chunk(2, dim=-1)#self.gamma(self.act(x)), self.beta(self.act(x))
+        #    _, gamma = self.act(self.gamma_branch(x)).chunk(2, dim=1)
+        #    _, beta = self.act(self.beta_branch(x)).chunk(2, dim=1)
+        #    x = self.act(self.film(self.global_state, gamma, beta))
+        if hasattr(self, 'dropout') and self.training:
+            x = self.dropout(x)
+        has_branches = self.has_branches(x).sigmoid()
+        if (has_branches.item() < .5) or (self.current_steps >= self.max_steps):
+            return {
+                'terminal': x,
+                'left': {},
+                'right': {},
+                'depth': depth_cost + has_branches,
+                'state': x,
+            }
+        else:
+            self.current_steps += 2
+            left, right = self.branch(x).chunk(2, dim=1)
+            #left_gamma, right_gamma = self.act(self.gamma_branch(x)).chunk(2, dim=1)
+            #left_beta, right_beta = self.act(self.beta_branch(x)).chunk(2, dim=1)
+            left, right = x - self.act(self.hidden(self.act(left))), x - self.act(self.hidden(self.act(right)))
+            #left_gamma, left_beta = self.condition(self.act(left)).chunk(2, dim=-1) #self.gamma(self.act(left)), self.beta(self.act(left))
+            #right_gamma, right_beta = self.condition(self.act(right)).chunk(2, dim=-1) #self.gamma(self.act(right)), self.beta(self.act(right))
+            
+            #left = self.act(self.film(self.global_state, left_gamma, left_beta))
+            #right = self.act(self.film(self.global_state, right_gamma, right_beta))
             if random.choice([True, False]):
                 left_branch = self.generate(left, depth_cost=depth_cost+has_branches, *args, **kwargs)
                 right_branch = self.generate(right, depth_cost=depth_cost+has_branches, *args, **kwargs)
@@ -256,6 +314,8 @@ class Encoder(nn.Module):
         self.embed = nn.Embedding(io, h)
         self.conv1 = nn.Conv1d(h, h, 3, 1, 1)
         self.conv2 = nn.Conv1d(h, h, 3, 1, 1)
+        self.conv3 = nn.Conv1d(h, h, 3, padding=(2*3 - 3 - (3-1)*(2-1)) + 1, dilation=2) 
+        self.conv4 = nn.Conv1d(h, h,  3, padding=(2*3 - 3 - (3-1)*(2-1)) + 1, dilation=2) 
         if kwargs.get('adaptor'):
             self.adaptor = nn.Linear(h, kwargs['adaptor'])  
     def forward(self, x, aux=None):
@@ -263,23 +323,26 @@ class Encoder(nn.Module):
             e = self.embed(x)
             if aux is not None:
                 e = e + aux
-            e = word_dropout(e, dropout=self.wd)
+            e, rw = word_dropout(e, dropout=self.wd)
         else:
             e = self.embed(x)
             if aux is not None:
                 e = (e + aux)
+            rw = None
         e = e.transpose(0,1).transpose(1,2)
         c1 = self.conv1(self.act(e))
-        c2 = self.conv2(self.act(c1))
+        c2 = self.conv2(self.act(c1)) + e
+        c3 = self.conv3(self.act(c2)) + c1
+        c4 = self.conv4(self.act(c3)) + c2
         if aux is None:
-            features = (c2 + e).transpose(1,2).transpose(0,1)
+            features = (c4).transpose(1,2).transpose(0,1)
             if hasattr(self, 'adaptor'):
                 features = self.adaptor(self.act(features.mean(0)))
             else:
                 features = features#.sum(0)
         else:
-            features = (c2 + e).transpose(1,2).transpose(0,1)#.sum(0)
-        return features
+            features = (c4).transpose(1,2).transpose(0,1)#.sum(0)
+        return features, rw
 
 class Classifier(nn.Module):
     def __init__(self, *args, **kwargs):

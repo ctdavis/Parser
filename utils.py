@@ -240,7 +240,7 @@ def word_dropout(x, dropout=0.2, max_retries=5):
     if retries >= max_retries and rw.sum().item() == 0.:
         return x
     rw = rw.unsqueeze(2).repeat(1, 1, x.shape[-1])
-    return rw * x
+    return rw * x, rw
 
 def split_terminal_leaves(x, cutoff1, cutoff2):
     a = F.gumbel_softmax(x[:, :, :cutoff1], hard=True)
@@ -287,7 +287,7 @@ def inspect_parsed_sentence_helper(_x, aux, E, G, C, charE, selector1, ds, ix, C
         aux = batch_data([torch.cat(aux)], 0, C.limit, G.h)
     if sizes is None:
         sizes = [x.shape[0]]
-    encoding = E(x, aux)
+    encoding, _ = E(x, aux)
     tree = G(G.act(encoding.sum(0)), sizes=[C.limit], return_trees=True)[0]
     leaves = G.get_leaves(tree)
     leaves, _ = pad(define_padded_vectors(nn.utils.rnn.pad_sequence([leaves]), 0), torch.zeros((C.limit,1)))

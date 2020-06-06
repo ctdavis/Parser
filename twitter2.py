@@ -39,20 +39,20 @@ r18 = lambda x: re.sub(r'cancelled flight(led)?', r'cancel', x)
 
 preprocessor = lambda x: [w for w in r13(r18(r17(r16(r15(r14(r13(r12(r11(r10(r8(r7(r6(r5(r4(r3(r2(r1(r0(r00(r000(x))))))))))))))))))))).strip().split(' ')]
 
-limit = 10
+limit = 15
 config = {
     'limit': limit,
     'df': pd.read_csv('./data/Tweets.csv'),
     'anchor': 'text',
-    'sample_size': 1000,
-    'test_size': 128,
+    'sample_size': 4104,
+    'test_size': 254,
     'unify': ['text','airline_sentiment'],
     'sleep': 0.5,
     'reserve': { 'text' : ['negative','positive','neutral'] },
     'vars': {
         'text': {
             'preprocessor': preprocessor,
-            'limit': 1,
+            'limit': 3,
             'pad': True,
             'extra_fxns': {
                 'sizes': ('text', lambda context, x: len(x))
@@ -123,13 +123,13 @@ model_config = {
 char_model_config = deepcopy(model_config)
 char_model_config.update({ 'wd': None, 'h': 64, 'adaptor': h, 'has_subsequence': False, 'io': len(ds.vars['chars']['vocab']) })
 classifier_config = deepcopy(model_config)
-classifier_config.update({ 'io': 3, 'n_heads': 2 })
+classifier_config.update({ 'io': 3, 'n_heads': 4 })
 copy_config = deepcopy(model_config)
 copy_config.update({ 'n_heads': None })
 
 charE = Encoder(**char_model_config)
 E = Encoder(**model_config)
-G = ResidualGenerator(**model_config)
+G = Generator(**model_config)
 C = Copy(**copy_config)
 CL = Classifier(**classifier_config)
 
@@ -184,7 +184,7 @@ for e in range(n_epochs):
 
         features, _ = E(T)#, _Tchars)
 
-        trees = G(act(G.hidden(act(features))).sum(0), sizes=[limit] * len(sizes), return_trees=True) #sizes
+        trees = G(act(features.sum(0)), sizes=[limit] * len(sizes), return_trees=True) #sizes
 
         leaves, depths, states = zip(*[
             (
@@ -201,7 +201,7 @@ for e in range(n_epochs):
         states = torch.cat(states)
 
         leaves, Tg = pad(define_padded_vectors(nn.utils.rnn.pad_sequence(leaves), PAD), Targ)
-        leaves = C(leaves, act(G.hidden(act(features))), sizes)
+        leaves = C(leaves, act(features), sizes)
         
         leaves = leaves.view(leaves.shape[0] * leaves.shape[1], -1)
         Tg = Tg.contiguous().view(-1)
@@ -255,7 +255,7 @@ for e in range(n_epochs):
 
         test_features, _ = E(test_words)#, test_chars)
 
-        test_trees = G(act(G.hidden(act(test_features))).sum(0), sizes=[limit] * len([test_words_data['sizes'][i] for i in tb]), return_trees=True)
+        test_trees = G(act(test_features.sum(0)), sizes=[limit] * len([test_words_data['sizes'][i] for i in tb]), return_trees=True)
         # [test_words_data['sizes'][i] for i in tb]
         tleaves, tdepths, tstates = zip(*[
             (
@@ -272,7 +272,7 @@ for e in range(n_epochs):
         tstates = torch.cat(tstates)
 
         tleaves, test_words_targ = pad(define_padded_vectors(nn.utils.rnn.pad_sequence(tleaves), PAD), test_words_targ)
-        tleaves = C(tleaves, act(G.hidden(act(test_features))), [test_words_data['sizes'][i] for i in tb]) #[limit]*batch_size)
+        tleaves = C(tleaves, act(test_features), [test_words_data['sizes'][i] for i in tb]) #[limit]*batch_size)
 
         tleaves = tleaves.view(tleaves.shape[0] * tleaves.shape[1], -1)
         test_words_targ = test_words_targ.contiguous().view(-1)
@@ -286,9 +286,9 @@ for e in range(n_epochs):
 
 
     features, _ = E(T[:, :1])#, _Tchars[:, :1])
-    trees = G(act(G.hidden(act(features))).sum(0), sizes=[limit], return_trees=True) # [limit]
+    trees = G(act(features.sum(0)), sizes=[limit], return_trees=True) # [limit]
     leaves, _ = pad(G.get_leaves(trees[0]).unsqueeze(1), T[:,:1])
-    leaves = C(leaves, act(G.hidden(act(features))), sizes[:1])
+    leaves = C(leaves, act(features), sizes[:1])
 
     tree = attach_to_leaves(trees[0], leaves, ds.vars['text'], model_config['io'], G, ds.vars['text']['text'][b[0]])
 
@@ -299,17 +299,17 @@ for e in range(n_epochs):
     print(f'GAcc: {round(epoch_gacc / n_batches, 3)}')
     print(f'ClLoss: {round(epoch_cl_loss / n_batches, 3)}')
     print(f'ClAcc: {round(epoch_cl_acc / n_batches, 3)}')
-    print(f'Test loss/depth/swd/acc/cl_acc: {", ".join(map(str, [round(tgloss / tn_batches, 3), round(tdepth_loss / tn_batches, 3), round(tswd / tn_batches, 3), round(tgacc / tn_batches, 3), round(tcl_acc / tn_batches, 3)]))}')
+    print(f'Test loss/depth/swd/acc/cl_acc: {", ".join(map(str, [round(tgloss / tn_batches, 3), round(tdepth_loss / tn_batches, 3), round(tswd / tn_batches, 3), round(tgacc / tn_batches, 3), round(tcl_acc / tn_batches, 3)]))}')#
     print(f'Reconstruction of: {" ".join([w for w in ds.vars["text"]["text"][b[0]]])}')
     print(f'                   {" ".join([ds.vars["text"]["reverse_vocab"][w.item()] for w in T[:,0] if w.item() != 0])}')
     try:
-        #inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, charE, 0, 'text', None,
-        #     CL, output_set, None, sizes=sizes[:1])
-        print_tree( #ds.vars['chars']['text'][b[0]],
-            tree,
-            lambda x: x,
-            attr='attachment'
-        )
+        inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, charE, 0, 'text', None,
+            CL, output_set, None, sizes=sizes[:1])
+        #print_tree(
+        #    tree,
+        #    lambda x: x,
+        #    attr='attachment'
+        #)
     except Exception as e:
         print(e)
     print()
