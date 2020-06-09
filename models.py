@@ -189,6 +189,45 @@ class MultiheadAttention(nn.Module):
         output = self.out(torch.cat([mix, query], dim=2))
         return output, scores
 
+class MultiheadAttention2(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(MultiheadAttention2, self).__init__()
+        self.h, self.n_heads = kwargs['h'], kwargs['n_heads']
+        #self.act = kwargs['act']
+        self.head_dim = self.h // self.n_heads
+        assert self.h == self.head_dim * self.n_heads
+    def forward(self, query, key, value, sizes=None, batch_first=False):
+        if sizes is not None:
+            sizes = torch.FloatTensor([
+                [0 if i < s else 1 for i in range(key.shape[1 if batch_first else 0])]
+                for s in sizes
+            ])
+        if not batch_first:
+            query = query.transpose(0,1)
+            key = key.transpose(0,1)
+            value = value.transpose(0,1)
+        b = query.shape[0]
+        query = query.view(b, -1, self.n_heads, self.head_dim)
+        key = key.view(b, -1, self.n_heads, self.head_dim)
+        value = value.view(b, -1, self.n_heads, self.head_dim)
+        query = query.transpose(1,2)
+        key = key.transpose(1,2)
+        value = value.transpose(1,2)
+        scores = torch.matmul(query, key.transpose(-2,-1)) / math.sqrt(self.head_dim)
+        #print(scores.shape, sizes.shape)
+        if sizes is not None:
+            scores = scores.permute(1,2,0,3).masked_fill(sizes == 1, -1e9).permute(2,0,1,3)
+        #print(scores)
+        scores = scores.softmax(-1)
+        #mix = torch.matmul(scores, key).view(b, -1, self.h)
+        mix = torch.matmul(scores, value).view(b, -1, self.h)
+        if not batch_first:
+            mix = mix.transpose(0,1)
+            query = query.transpose(0,1).contiguous().view(-1, b, self.h) 
+        #output = self.out(torch.cat([mix, query], dim=2))
+        output = mix
+        return output, scores
+
 class Generator(BatchGenerator):
     def __init__(self, *args, **kwargs):
         super(Generator, self).__init__(*args, **kwargs)
@@ -318,8 +357,8 @@ class Encoder(nn.Module):
         self.conv4 = nn.Conv1d(h, h,  3, padding=(2*3 - 3 - (3-1)*(2-1)) + 1, dilation=2) 
         if kwargs.get('adaptor'):
             self.adaptor = nn.Linear(h, kwargs['adaptor'])  
-    def forward(self, x, aux=None):
-        if self.training and self.wd is not None:
+    def forward(self, x, aux=None, use_wd=True):
+        if self.training and self.wd is not None and use_wd is True:
             e = self.embed(x)
             if aux is not None:
                 e = e + aux
@@ -351,6 +390,8 @@ class Classifier(nn.Module):
         self.act = kwargs['act']
         if kwargs.get('n_heads') is not None:
             self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
+            #self.value = nn.Linear(self.h, self.h)
+            #self.A = MultiheadAttention2(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
         else:
             self.A = Attention(self.h)
         self.C = nn.Linear(self.io * self.h, self.io)
@@ -358,11 +399,28 @@ class Classifier(nn.Module):
         output, attn = zip(*[
             self.A(
                 output_set,
-                state,
+                state
+                #self.act(self.value(state))
             )
             for state in states
         ])
         return torch.cat([self.C(self.act(o).view(1, -1)) for o in output]), attn
+
+class Classifier2(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(Classifier2, self).__init__()
+        self.io, self.h, self.act = kwargs['io'], kwargs['h'], kwargs['act']
+        self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
+        self.C = nn.Linear(self.h, self.io)
+    def forward(self, q, k):
+        output, attn = zip(*[
+            self.A(
+                q_state,
+                k_state,
+            )
+            for q_state, k_state in zip(q, k)
+        ])
+        return torch.cat([self.C(self.act(o).max(0)[0]) for o in output]), attn
 
 class Copy(nn.Module):
     def __init__(self, *args, **kwargs):

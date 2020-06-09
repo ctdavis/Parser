@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import Dataset
 
 import pandas as pd
 import numpy as np
@@ -117,49 +118,10 @@ def print_tree(x, transform=lambda x: x, attr='terminal'):
             fx(x['right'], nx[1])
     fx(x, nx)
     nx = Tree.fromstring(str(nx).replace('(','{').replace(')','}').replace('[','(').replace(']',')').replace('),',')'))
-    nx.pretty_print() #.replace('[','(').replace(']',')')
+    nx.pretty_print()
 
 def pad(x, y, pad=None, force_continue=False):
-    if type(x) in [list, tuple] and type(y) in [list, tuple]:
-        if type(x) is tuple:
-            x = list(x)
-        if type(y) is tuple:
-            y = list(y)
-        assert len(x) == len(y)
-        assert type(x[0]) in [list,torch.Tensor]
-        if type(x[0][0]) not in [list, torch.Tensor]:
-             pad = None
-        else:
-             pad = [None]
-        for ix, (_x,_y) in enumerate(zip(x, y)):
-            if len(_y) < len(_x):
-                diff = len(_x) - len(_y)
-                if type(_y) is torch.Tensor:
-                    y[ix] = torch.cat([_y, torch.LongTensor([0]*diff)])
-                else:
-                    y[ix] = _y + ([pad] * diff)
-            elif len(_x) < len(_y):
-                diff = len(_y) - len(_x)
-                if type(_x) is torch.Tensor:
-                    #print(_x.shape, _y.shape)
-                    p = torch.zeros((diff,_x.shape[1]))
-                    x[ix] = torch.cat([_x, p])  #torch.FloatTensor([0]*diff)])
-                else:
-                    x[ix] = _x + ([pad] * diff)
-            #print(type(x[0][0]), type(y[0][0]))
-            if type(x[0][0]) not in [list, torch.Tensor] or type(y[0][0]) is int or force_continue:
-                continue
-            for _ix, (_x_, _y_) in enumerate(zip(x[ix], y[ix])):
-                if len(_y_) < len(_x_):
-                    diff = len(_x_) - len(_y_)
-                    if type(_y_) is torch.Tensor:
-                        y[ix][_ix] = torch.cat([_y_, torch.LongTensor([0]*diff)])
-                    else:
-                        y[ix][_ix] = _y_ + (pad * diff)
-                elif len(_x_) < len(_y_):
-                    diff = len(_y_) - len(_x_)
-                    x[ix][_ix] = _x_ + (pad * diff)
-    elif y.shape[0] < x.shape[0]:
+    if y.shape[0] < x.shape[0]:
         diff = x.shape[0] - y.shape[0]
         if len(y.shape) == 1:
             y = F.pad(y, (0, diff), value=PAD)
@@ -185,13 +147,15 @@ def pad(x, y, pad=None, force_continue=False):
                 x[diff+1:,:,pad] = 1.
     return x, y
 
-def get_vocab(d, l=0, no_pad=False):
-    if no_pad and l == 0:
-        V = { '<pad>': 0 } # overriding this option for now
-    elif l == 0:
+def get_vocab(d, l=0, pad=True):
+    if not pad and l == 0:
+        V = {}
+    elif pad and l == 0:
         V = { '<pad>': 0 }
+    elif not pad and l > 0:
+        V = { '<unk>': 0 }
     else:
-        V = { '<pad>': 0, '<unk>': 1 }
+        V = { '<pad>': 0, '<unk>': 1}
     lV = len(V)
     if type(d[0][0]) is list:
         vocab = chain(*chain(*d))
@@ -242,12 +206,6 @@ def word_dropout(x, dropout=0.2, max_retries=5):
     rw = rw.unsqueeze(2).repeat(1, 1, x.shape[-1])
     return rw * x, rw
 
-def split_terminal_leaves(x, cutoff1, cutoff2):
-    a = F.gumbel_softmax(x[:, :, :cutoff1], hard=True)
-    b = F.gumbel_softmax(x[:, :, cutoff1:cutoff1+cutoff2], hard=True)
-    c = F.gumbel_softmax(x[:, :, cutoff1+cutoff2:], hard=True)
-    return torch.cat([a, b, c], dim=-1)
-
 def decode_leaf(rv, g, x, sz=100):
     return ''.join([
         rv[l] for l in 
@@ -274,20 +232,15 @@ def expected_depth(x, mode='sum'):
 def random_encodings(batch, embed, sd=1.):
     return torch.normal(0., sd, (batch, emb))
 
-def inspect_parsed_sentence_helper(_x, aux, E, G, C, charE, selector1, ds, ix, CL=None, output_set=None, act=F.selu, sizes=None, selector2=None):
+def inspect_parsed_sentence_helper(_x, E, G, C, selector1, ds, ix, CL=None, output_set=None, act=F.selu, sizes=None):
     if type(_x) is str:
         x = ds.vars[selector1]['encoder'](ds.vars[selector1]['preprocessor'](_x))
     else:
         x = ds.vars[selector1]['encoder'](_x)
     x = batch_data([x], 0, C.limit)
-    if selector2 is not None:
-        if aux is None:
-            aux = ds.vars[selector2]['preprocessor'](_x)
-        aux = [charE(w.unsqueeze(1)) for w in ds.vars[selector2]['encoder'](aux)]
-        aux = batch_data([torch.cat(aux)], 0, C.limit, G.h)
     if sizes is None:
         sizes = [x.shape[0]]
-    encoding, _ = E(x, aux)
+    encoding, _ = E(x)
     tree = G(G.act(encoding.sum(0)), sizes=[C.limit], return_trees=True)[0]
     leaves = G.get_leaves(tree)
     leaves, _ = pad(define_padded_vectors(nn.utils.rnn.pad_sequence([leaves]), 0), torch.zeros((C.limit,1)))
@@ -302,8 +255,8 @@ def inspect_parsed_sentence_helper(_x, aux, E, G, C, charE, selector1, ds, ix, C
         return (tree, attn_weights, classification)
     return (tree, None, None)
 
-def inspect_parsed_sentence(s, ds, E, G, C, charE, ix, selector, aux=None, CL=None, output_set=None, selector2=None, sizes=None, print_s=False):
-    tree, weights, classification = inspect_parsed_sentence_helper(s, aux, E, G, C, charE, selector, ds, ix, CL, output_set, selector2=selector2, sizes=sizes)
+def inspect_parsed_sentence(s, ds, E, G, C, ix, selector, CL=None, output_set=None, sizes=None, print_s=False):
+    tree, weights, classification = inspect_parsed_sentence_helper(s, E, G, C, selector, ds, ix, CL, output_set, sizes=sizes)
     #print(weights[0].shape)
     weights = weights[0].squeeze(0).transpose(0,1)
     if output_set is not None and CL is not None:
@@ -323,26 +276,6 @@ def inspect_parsed_sentence(s, ds, E, G, C, charE, ix, selector, aux=None, CL=No
         sent = sents[classification.softmax(-1).argmax(-1).item()]['sent']
         print(sent, subtrees[sent])
 
-def parse_batch(X, E, G, sizes, use_vocab=True):
-    encodings = E(X)
-    trees = G(encodings, sizes=[s.item() for s in sizes], return_trees=True)
-    leaves, encodings, states, depths = zip(*[
-        (G.get_leaves(t), t['state'], G.get_states(t).unsqueeze(1), G.get_leaves(t, attr='depth').sum(0,keepdim=True))
-        for t in trees
-    ])
-    if use_vocab:
-        vocab = [F.gumbel_softmax(l, hard=True).sum(0,keepdim=True) for l in leaves]
-    else:
-        vocab = None
-    return leaves, encodings, states, vocab, depths
-
-def get_ps_from_webpage(url='https://en.wikipedia.org/wiki/Special:Random', tokenize_sents=True):
-    page = requests.get(url)
-    soup = BeautifulSoup(page.content, 'html.parser')
-    ps = soup.find_all('p')
-    if tokenize_sents:
-        return list(chain(*[sent_tokenize(p.get_text()) for p in ps]))
-    return [p.get_text() for p in ps]
 
 def batch_data(x, pad, limit, emb=1):
     if x[0].dim() == 1:
@@ -370,75 +303,41 @@ def attach_to_leaves(tree, leaves, var, io, G, source):
     G.attach_to_leaves(tree, leaves)
     return tree
 
-class Dataset:
+class LanguageDataset(Dataset):
     def __init__(self, config):
-        self.config = config
+        if 'state_dict' in config:
+            self.load_state_dict(config['state_dict'])
+            return
+        df = config['source'][list(config['vars'].keys())]
+        reserve = config.get('reserve')
+        unify = config.get('unify')
+        anchor = config.get('anchor')
+        df = df[df[anchor].map(
+            lambda x: len(config['vars'][anchor]['preprocessor'](x)) <= config['len_limit']
+        )].sample(config['sample_size']).reset_index(drop=True)
+        self.test_df = df.iloc[-config['test_size']:]
+        df = df.iloc[:-config['test_size']]
         self.vars = {}
-        self.sample_size = self.config['sample_size']
-        self.unify = config.get('unify')
-        self.flatten = config.get('flatten') is True
-        self.reserve = config.get('reserve')
-        anchor = self.config['anchor']
-        self.anchor = anchor
-        anchor_preprocessor = self.config['vars'][anchor]['preprocessor']
-        limit = self.config['limit']
-        df = self.config['df']#[:self.config['test_size']]
-        #self.test_df = self.config['df'][self.config['test_size']:]
-        self.len_filter = (lambda x: len(anchor_preprocessor(x)) <= limit)
-        if type(df) is str and df == 'random_wiki':
-            self.citation_filter = (lambda x: not re.search(r'^(\[\d+\])+$', x))
-            text = []
-            counter = 0
-            while len(text) < self.sample_size:
-                text += list(filter(lambda x: self.len_filter(x) and self.citation_filter(x) and len(anchor_preprocessor(x)) > 0, get_ps_from_webpage())) #self.citation_filter(x)
-                if counter % 10 == 0:
-                    print(f'{round(len(text)/self.sample_size, 4) * 100} % of required samples')
-                counter += 1
-                sleep(1 if 'sleep' not in config else config['sleep'])
-            #text = text[:self.sample_size]
-            df = pd.DataFrame({anchor: text})
-        else:
-            df = df[df[anchor].map(self.len_filter)].sample(self.sample_size).reset_index(drop=True)
-            self.test_df = df.iloc[-self.config['test_size']:]
-            df = df.iloc[:-self.config['test_size']]
-        if self.unify or self.flatten:
+        self.sample_size = config['sample_size']
+        self.test_size = config['test_size']
+        if unify:
             master = {}
-            if self.flatten:
-                data = list(chain(*[
-                    w
-                    for k,v in self.config['vars'].items()
-                    for w in df[k].map(v['preprocessor']).tolist()
-                ]))
-            else:
-                data = list(chain(*[
-                    [
-                        [w for w in s if not (k in self.reserve and w in self.reserve[k])]
-                        for s in df[k].map(v['preprocessor']).tolist()
-                    ]
-                    for k,v in self.config['vars'].items()
-                    if k in self.unify
-                ]))
+            data = list(chain(*[
+                [
+                    [w for w in s if not (k in reserve and w in reserve[k])]
+                    for s in df[k].map(v['preprocessor']).tolist()
+                ]
+                for k,v in config['vars'].items()
+                if k in unify
+            ]))
             master_vocab, reverse_master_vocab = get_vocab(
                 pd.Series(data),
-                self.config['vars'][anchor]['limit'],
-                self.config['vars'][anchor]['pad']
+                config['vars'][anchor]['limit'],
+                config['vars'][anchor]['pad']
             )
             master_encoder = partial(vocab_encoder, master_vocab)
-            if self.flatten:
-                self.vars[anchor] = {}
-                self.vars[anchor]['text'] = data
-                self.vars[anchor]['vocab'], self.vars[anchor]['reverse_vocab'] = (master_vocab, reverse_master_vocab)
-                self.vars[anchor]['encoder'] = master_encoder
-                self.vars[anchor]['vectors'] = list(map(self.vars[anchor]['encoder'], self.vars[anchor]['text']))
-                self.vars[anchor]['preprocessor'] = anchor_preprocessor
-                if 'extra_fxns' in self.config['vars'][anchor]:
-                    self.vars[anchor]['extra_fxns'] = self.config['vars'][anchor]['extra_fxns']
-                    for fxn_name, (ref, fxn) in self.config['vars'][anchor]['extra_fxns'].items():
-                        self.vars[anchor][fxn_name] = list(map(partial(fxn, self.vars[anchor]), self.vars[anchor][ref]))
              
-        for k,v in self.config['vars'].items():
-            if self.flatten:
-                break
+        for k,v in config['vars'].items():
             self.vars[k] = {}
             if k not in df.columns:
                 data = df[v['source']].map(v['preprocessor'])
@@ -446,7 +345,7 @@ class Dataset:
                 data = df[k].map(v['preprocessor'])
             self.vars[k]['preprocessor'] = v['preprocessor']
             self.vars[k]['text'] = data
-            if k in self.unify:
+            if k in unify:
                 self.vars[k]['vocab'], self.vars[k]['reverse_vocab'] = (master_vocab, reverse_master_vocab)
                 self.vars[k]['encoder'] = master_encoder
             else:
@@ -457,30 +356,43 @@ class Dataset:
                 self.vars[k]['extra_fxns'] = v['extra_fxns']
                 for fxn_name, (ref, fxn) in v['extra_fxns'].items():
                     self.vars[k][fxn_name] = list(map(partial(fxn, self.vars[k]), self.vars[k][ref]))
-
-    def preprocess_new_observations(self, var, x):
+    def __len__(self):
+        return len(list(self.vars.values())[0]['vectors'])
+    def __getitem__(self, idx):
+        #return [v['vectors'][idx] for v in self.vars.values()]
+        return { 
+            k: {
+                _k: v[_k][idx]
+                for _k in v.keys()
+                if _k not in ['extra_fxns','vocab','encoder','text','preprocessor','reverse_vocab']
+            }
+            for k,v in self.vars.items()
+        }
+    def state_dict(self):
+        return {
+            k: {
+                _k:_v
+                for _k,_v in v.items()
+                if _k in ['preprocessor','vocab', 'reverse_vocab', 'extra_fxns', 'encoder']
+            }
+            for k,v in self.vars.items()
+        }
+    def load_state_dict(self, state_dict):
+        self.vars = state_dict
+    def preprocess_new_observations(self, var, x, replace_underlying_data=False):
         out = {}
         preprocessor = self.vars[var]['preprocessor']
         encoder = self.vars[var]['encoder']
-        #extra_fxns = self.vars[var]['extra_fxns']
-        if self.flatten:
-            out['text'] = list(chain(*[[list(w) for w in preprocessor(s)] for s in x]))
-        else:
-            out['text'] = list(map(preprocessor, x))
+        out['text'] = list(map(preprocessor, x))
         out['vectors'] = list(map(encoder, out['text']))
         if 'extra_fxns' in self.vars[var]:
             for fxn_name, (ref, fxn) in self.vars[var]['extra_fxns'].items():
                 out[fxn_name] = list(map(partial(fxn, self.vars[var]), out[ref]))
-        return out
-
-    def get_random_wiki(self):
-        text = []
-        counter = 0
-        while len(text) < self.sample_size:
-            text += list(filter(lambda x: self.len_filter(x) and self.citation_filter(x), get_ps_from_webpage()))
-            if counter % 10 == 0:
-                    print(f'{round(len(text)/self.sample_size, 4) * 100} % of required samples')
-            counter += 1
-            sleep(1 if 'sleep' not in self.config else self.config['sleep'])
-        df = pd.DataFrame({self.anchor: text})
-        return self.preprocess_new_observations(self.anchor, df[self.anchor].tolist())       
+        if replace_underlying_data:
+            self.vars[var]['text'] = out['text']
+            self.vars[var]['vectors'] = out['vectors']
+            if 'extra_fxns' in self.vars[var]:
+                for fxn_name, (ref, fxn) in self.vars[var]['extra_fxns'].items():
+                    self.vars[var][fxn_name] = list(map(partial(fxn, self.vars[var]), self.vars[var][ref]))
+            return None
+        return out    

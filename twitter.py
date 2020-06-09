@@ -15,69 +15,57 @@ import math
 from utils import *
 from models import *
 
-r000 = lambda x: re.sub('&amp;', 'and', x.lower())
-r00 = lambda x: re.sub(r'(…|\.\.\.)', r'.', x)
-r0 = lambda x: re.sub('’', r"'", x)
-r1 = lambda x: re.sub('(”|“)', r'"', x) 
-r2 = lambda x: re.sub(r'(http\S+)',r'<u>',x)
-r3 = lambda x: re.sub(r'(.)\1{2,}', r'\1', x) # must run before r4; captures any character that repeats more than twice ('iiii', '!!!')
-r4 = lambda x: re.sub(r'([^a-z])\1+', r'\1', x) # captures any non alphebetical character that repeats at all
-r5 = lambda x: re.sub(r'([a-z])([^a-z])([a-z])', r'\1 \2 \3', x.lower()) #re.sub(r'(\S)([.!?’"\',$/:\(\)])(\S)'  
-r6 = lambda x: re.sub(r'([a-z])([^a-z])', r'\1 \2', x.lower()) #re.sub(r'(\S)([.!?’"\',$/:\(\)])', r'\1 \2', x.lower())
-r7 = lambda x: re.sub(r'([^a-z])([a-z])', r'\1 \2', x.lower()) #re.sub(r'([.!?’"\',$/:\(\)])(\S)', r'\1 \2', x.lower())
-r8 = lambda x: x.replace('\n',' ')
-#r9 = lambda x: x.replace('&amp;','and')
-r10 = lambda x: re.sub(r'(@) (\S+)', r'\1', x)
-r11 = lambda x: re.sub(r'(#) (\S+)', r'\1', x)
-r12 = lambda x: re.sub(r'((\$?[0-9]+[.,:/ -]?[0-9]+)+|[0-9])', r'<n>', x)
-r13 = lambda x: re.sub(r'\s{2,}',r' ', x)
-r14 = lambda x: re.sub(r'(^@ | (<u>|#)$)', r'', x)
-r15 = lambda x: re.sub(r'(\S)(<n>)', r'\1 \2', x)
-r16 = lambda x: re.sub(r'< (u|n) >', r'<\1>', x)
-r17 = lambda x: re.sub(r'(<n>)(\S)', r'\1 \2', x)
-r18 = lambda x: re.sub(r'cancelled flight(led)?', r'cancel', x)
+def preprocessor(x, lower=True):
+    if lower:
+        x = x.lower()
+    x = re.sub(r'&amp;', 'and', x)
+    x = re.sub(r'(http\S+)',r'<u>',x)
+    x = re.sub(r'cancelled flightled', r'cancelled', x)
+    x = re.sub(r'(.)\1{2,}', r'\1', x)
+    x = re.sub(r'(\W)', r' \1 ', x)
+    x = re.sub(r'< u >', r'<u>', x)
+    x = re.sub(r'\s{2,}', r' ', x)
+    return x.strip().split(' ')
 
-preprocessor = lambda x: [w for w in r13(r18(r17(r16(r15(r14(r13(r12(r11(r10(r8(r7(r6(r5(r4(r3(r2(r1(r0(r00(r000(x))))))))))))))))))))).strip().split(' ')]
+def size_fxn(context, x):
+    return len(x)
 
-limit = 10
+def target_fxn(context, x):
+    return torch.LongTensor([len(context['vocab']) - (x + 1)])
+
+def preprocess_sentiment(x):
+    return [x]
+
+limit = 15
 config = {
-    'limit': limit,
-    'df': pd.read_csv('./data/Tweets.csv'),
-    'anchor': 'text',
-    'sample_size': 1000,
+    'len_limit': limit,
+    'sample_size': 3000,
     'test_size': 128,
+    'source': pd.read_csv('data/Tweets.csv'),
     'unify': ['text','airline_sentiment'],
-    'sleep': 0.5,
-    'reserve': { 'text' : ['negative','positive','neutral'] },
+    'reserve': { 'text': ['positive','neutral','negative'] },
+    'anchor': 'text',
     'vars': {
         'text': {
-            'preprocessor': preprocessor,
-            'limit': 1,
+            'limit': 3,
             'pad': True,
+            'preprocessor': preprocessor,
             'extra_fxns': {
-                'sizes': ('text', lambda context, x: len(x))
+                'sizes': ('text', size_fxn)
              },
         },
-        'chars': {
-            'source': 'text',
-            'preprocessor': lambda x: list(map(list, preprocessor(x))),
-            'limit': 1,
-            'pad': True,
-            'extra_fxns': {
-                'sizes': ('text', lambda context, x: list(map(len, x)))
-            }
-        },
         'airline_sentiment': {
-            'preprocessor': lambda x: [x],
             'limit': 0,
+            'pad': False,
+            'preprocessor': preprocess_sentiment,
             'extra_fxns': {
-                'target': ('vectors', lambda context, x: torch.LongTensor([len(context['vocab']) - (x+1)]))
+                'target': ('vectors', target_fxn)
             }
         }
     }
 }
 
-ds = Dataset(config)
+ds = LanguageDataset(config)
 
 output_set = torch.LongTensor([
     ds.vars['text']['vocab']['positive'],
@@ -100,7 +88,7 @@ tn_batches = config['test_size'] // batch_size
 e = 128
 h = 128
 act = F.selu
-max_char_size = max(map(len, chain(*ds.vars['chars']['text'])))
+#max_char_size = max(map(len, chain(*ds.vars['chars']['text'])))
 start_char_modelling_at = 0.0
 
 ce = nn.CrossEntropyLoss()
@@ -112,28 +100,23 @@ model_config = {
     'batch': batch_size,
     'act': act,
     'preterminal': False,
-    'wd': .05,
+    'wd': 0.05,
     'pad': PAD,
     'sentiment': len(ds.vars['airline_sentiment']['vocab']),
     'limit': limit,
     'dr': None,
-    #'has_subsequence': True,
 }
 
-char_model_config = deepcopy(model_config)
-char_model_config.update({ 'wd': None, 'h': 64, 'adaptor': h, 'has_subsequence': False, 'io': len(ds.vars['chars']['vocab']) })
 classifier_config = deepcopy(model_config)
-classifier_config.update({ 'io': 3, 'n_heads': 2 })
+classifier_config.update({ 'io': 3, 'n_heads': 1 })
 copy_config = deepcopy(model_config)
 copy_config.update({ 'n_heads': None })
 
-charE = Encoder(**char_model_config)
 E = Encoder(**model_config)
-G = ResidualGenerator(**model_config)
+G = Generator(**model_config)
 C = Copy(**copy_config)
 CL = Classifier(**classifier_config)
 
-charE.apply(weight_init)
 E.apply(weight_init)
 G.apply(weight_init)
 C.apply(weight_init)
@@ -156,35 +139,31 @@ for e in range(n_epochs):
 
     E.train()
     G.train()
-    charE.train()
     C.train()
     CL.train()
 
     for ix, b in enumerate(batch_indices(ixs, batch_size, n_batches)): 
 
-        T, Tchars, sizes, sentiment_target = zip(*[
+        T, sizes, sentiment_target = zip(*[
             (
                 ds.vars['text']['vectors'][i],
-                ds.vars['chars']['vectors'][i],
                 ds.vars['text']['sizes'][i],
                 ds.vars['airline_sentiment']['target'][i]
             )
             for i in b
         ])
 
-        # zero tensors added to end ensure all observations are the same length
         Targ = [torch.cat([w.unsqueeze(0) if w != 1 else torch.LongTensor([ix+model_config['io']]) for ix,w in enumerate(t)]) for t in T]
         sentiment_target = torch.cat(sentiment_target)
 
-        #_Tchars = batch_data([torch.cat([charE(w.unsqueeze(1)) for w in s]) for s in Tchars], PAD, limit, h)
         T = batch_data(list(T), PAD, limit)
         Targ = batch_data(list(Targ), PAD, limit)
 
         optM.zero_grad()
 
-        features, _ = E(T)#, _Tchars)
+        features, _ = E(T)
 
-        trees = G(act(G.hidden(act(features))).sum(0), sizes=[limit] * len(sizes), return_trees=True) #sizes
+        trees = G(act(features.sum(0)), sizes=[limit] * len(sizes), return_trees=True) #sizes
 
         leaves, depths, states = zip(*[
             (
@@ -200,15 +179,15 @@ for e in range(n_epochs):
         depths = torch.cat([d.sum(0,keepdim=True) for d in depths]).squeeze(1)
         states = torch.cat(states)
 
-        leaves, Tg = pad(define_padded_vectors(nn.utils.rnn.pad_sequence(leaves), PAD), Targ)
-        leaves = C(leaves, act(G.hidden(act(features))), sizes)
-        
-        leaves = leaves.view(leaves.shape[0] * leaves.shape[1], -1)
-        Tg = Tg.contiguous().view(-1)
+        leaves = batch_data(leaves, PAD, limit).contiguous()
+        leaves = C(leaves, act(features), sizes)
 
-        gloss = ce(leaves, Tg)
+        leaves = leaves.view(leaves.shape[0] * leaves.shape[1], -1)
+        Targ = Targ.contiguous().view(-1)
+
+        gloss = ce(leaves, Targ)
         cl_loss = ce(sentiment, sentiment_target)
-        depth_loss = mse(depths, expected_depth(sizes))
+        depth_loss = mse(depths, expected_depth(sizes)) * 0.1
         swd = sliced_wasserstein_distance(states)
 
         loss = gloss + depth_loss + swd + cl_loss
@@ -221,12 +200,11 @@ for e in range(n_epochs):
         epoch_depth_loss += depth_loss.item()
         epoch_cl_loss += cl_loss.item()
         epoch_swd += swd.item()
-        epoch_gacc += (leaves.log_softmax(-1).argmax(-1) == Tg).long().float().mean().item()
+        epoch_gacc += (leaves.log_softmax(-1).argmax(-1) == Targ).long().float().mean().item()
         epoch_cl_acc += (sentiment.softmax(-1).argmax(-1) == sentiment_target).long().float().mean().item()
 
     E.eval()
     G.eval()
-    charE.eval()
     C.eval()
     CL.eval()
 
@@ -238,7 +216,6 @@ for e in range(n_epochs):
     tcl_acc = 0.
 
     test_words_data = ds.preprocess_new_observations('text', ds.test_df.text)
-    #test_chars_data = ds.preprocess_new_observations('chars', ds.test_df.text)
     test_sentiment_data = ds.preprocess_new_observations('airline_sentiment', ds.test_df.airline_sentiment)
 
     for ix, tb in enumerate(batch_indices(tixs, batch_size, tn_batches)): 
@@ -249,14 +226,12 @@ for e in range(n_epochs):
             for t in [test_words_data['vectors'][i] for i in tb]
         ]
         
-        #test_chars = batch_data([torch.cat([charE(w.unsqueeze(1)) for w in s]) for s in [test_chars_data['vectors'][i] for i in tb]], PAD, limit, h)
         test_words = batch_data(list([test_words_data['vectors'][i] for i in tb]), PAD, limit)
         test_words_targ = batch_data(list(test_words_targ), PAD, limit)
 
-        test_features, _ = E(test_words)#, test_chars)
+        test_features, _ = E(test_words)
 
-        test_trees = G(act(G.hidden(act(test_features))).sum(0), sizes=[limit] * len([test_words_data['sizes'][i] for i in tb]), return_trees=True)
-        # [test_words_data['sizes'][i] for i in tb]
+        test_trees = G(act(test_features.sum(0)), sizes=[limit] * len([test_words_data['sizes'][i] for i in tb]), return_trees=True)
         tleaves, tdepths, tstates = zip(*[
             (
                 G.get_leaves(t),
@@ -271,24 +246,24 @@ for e in range(n_epochs):
         tdepths = torch.cat([d.sum(0,keepdim=True) for d in tdepths]).squeeze(1)
         tstates = torch.cat(tstates)
 
-        tleaves, test_words_targ = pad(define_padded_vectors(nn.utils.rnn.pad_sequence(tleaves), PAD), test_words_targ)
-        tleaves = C(tleaves, act(G.hidden(act(test_features))), [test_words_data['sizes'][i] for i in tb]) #[limit]*batch_size)
+        tleaves = batch_data(tleaves, PAD, limit).contiguous()
+        tleaves = C(tleaves, act(test_features), [test_words_data['sizes'][i] for i in tb])
 
         tleaves = tleaves.view(tleaves.shape[0] * tleaves.shape[1], -1)
         test_words_targ = test_words_targ.contiguous().view(-1)
 
         tgloss += ce(tleaves, test_words_targ).item()
-        tdepth_loss += mse(tdepths, expected_depth([test_words_data['sizes'][i] for i in tb])).item()
+        tdepth_loss += mse(tdepths, expected_depth([test_words_data['sizes'][i] for i in tb])).item() * 0.1
         tswd += sliced_wasserstein_distance(tstates).item()
         tcl_loss += ce(tsentiment, tsentiment_target).item()
         tgacc += (tleaves.log_softmax(-1).argmax(-1) == test_words_targ).long().float().mean().item()
         tcl_acc += (tsentiment.softmax(-1).argmax(-1) == tsentiment_target).long().float().mean().item()
 
 
-    features, _ = E(T[:, :1])#, _Tchars[:, :1])
-    trees = G(act(G.hidden(act(features))).sum(0), sizes=[limit], return_trees=True) # [limit]
-    leaves, _ = pad(G.get_leaves(trees[0]).unsqueeze(1), T[:,:1])
-    leaves = C(leaves, act(G.hidden(act(features))), sizes[:1])
+    features, _ = E(T[:, :1])
+    trees = G(act(features.sum(0)), sizes=[limit], return_trees=True)
+    leaves = batch_data([G.get_leaves(trees[0])], PAD, limit).contiguous()
+    leaves = C(leaves, act(features), sizes[:1])
 
     tree = attach_to_leaves(trees[0], leaves, ds.vars['text'], model_config['io'], G, ds.vars['text']['text'][b[0]])
 
@@ -303,13 +278,7 @@ for e in range(n_epochs):
     print(f'Reconstruction of: {" ".join([w for w in ds.vars["text"]["text"][b[0]]])}')
     print(f'                   {" ".join([ds.vars["text"]["reverse_vocab"][w.item()] for w in T[:,0] if w.item() != 0])}')
     try:
-        #inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, charE, 0, 'text', None,
-        #     CL, output_set, None, sizes=sizes[:1])
-        print_tree( #ds.vars['chars']['text'][b[0]],
-            tree,
-            lambda x: x,
-            attr='attachment'
-        )
+        inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, 0, 'text', CL, output_set, sizes=sizes[:1])
     except Exception as e:
         print(e)
     print()
