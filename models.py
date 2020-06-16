@@ -9,6 +9,8 @@ import math
 
 from utils import *
 
+wn = torch.nn.utils.weight_norm
+
 class BatchGenerator(nn.Module):
     def __init__(self, *args, **kwargs):
         super(BatchGenerator, self).__init__()
@@ -38,10 +40,13 @@ class BatchGenerator(nn.Module):
             return leaves
     def generate(self, x, is_root=True, *args, **kwargs):
         raise NotImplementedError
-    def get_leaves(self, x, attr='terminal', cat=True):
+    def get_leaves(self, x, attr='terminal', cat=True, extra_attrs=[None]):
         def descend(x):
             if x['left'] == {}:
                 leaves.append(x[attr])
+                if type(extra_attrs) is list and extra_attrs[0] != None:
+                    for a in extra_attrs:
+                        leaves[-1] += ('_' + str(x[a]))
             else:
                 descend(x['left'])
                 descend(x['right'])
@@ -86,29 +91,46 @@ class BatchGenerator(nn.Module):
         leaves = []
         descend(x)
         return leaves
+    def add_vertices(self, x):
+        def descend(x, v):
+            if x['left'] == {}:
+                x['vertex'] = v[0]
+            else:
+                x['vertex'] = v[0]
+                v[0] += 1
+                edges[0] += [[x['vertex'], v[0]]]
+                descend(x['left'], v)
+                v[0] += 1
+                edges[0] += [[x['vertex'], v[0]]]
+                descend(x['right'], v)
+        edges = [[]]
+        v = [0]
+        descend(x, v)
+        return edges[0]
+
 
 class CharEncoder(nn.Module):
     def __init__(self, *args, **kwargs):
         super(CharEncoder, self).__init__()
-        i, h = kwargs['i'], kwargs['h']
+        io, h = kwargs['io'], kwargs['h']
         self.act = kwargs['act']
-        self.conv0 = nn.Conv1d(i, h, 3, 1, 1)
-        self.conv1 = nn.Conv1d(h, h, 3, 1, 1)
+        self.conv0 = wn(nn.Conv1d(io, h, 3, 1, 1))
+        self.conv1 = wn(nn.Conv1d(h, h, 3, 1, 1))
     def forward(self, x):
         c0 = self.act(self.conv0(x))
-        c1 = self.act(self.conv1(c0))
-        c1 = torch.cat([c0, c1], dim=1)
-        return c1.mean(-1)
+        c1 = self.act(self.conv1(c0).sum(-1))
+        #c1 = torch.cat([c0, c1], dim=1)
+        return c1#.mean(-1)
 
 class Attention(nn.Module):
     def __init__(self, dim, sm_over_context=True, double_linear_out=False):
         super(Attention, self).__init__()
         if double_linear_out is True:
             self.double_linear_out = True
-            self.linear_out = nn.Linear(dim*2, dim*2)
+            self.linear_out = wn(nn.Linear(dim*2, dim*2))
         else:
             self.double_linear_out = False
-            self.linear_out = nn.Linear(dim*2, dim)
+            self.linear_out = wn(nn.Linear(dim*2, dim))
         self.sm_over_context = sm_over_context
     def forward(self, output, context, sizes=None):
         if sizes is not None:
@@ -161,7 +183,7 @@ class MultiheadAttention(nn.Module):
         #self.act = kwargs['act']
         self.head_dim = self.h // self.n_heads
         assert self.h == self.head_dim * self.n_heads
-        self.out = nn.Linear(self.h * 2, self.h)
+        self.out = wn(nn.Linear(self.h * 2, self.h))
     def forward(self, query, key, sizes=None, batch_first=False):
         if sizes is not None:
             sizes = torch.FloatTensor([
@@ -235,9 +257,9 @@ class Generator(BatchGenerator):
         self.act = kwargs['act']
         self.o = o
         self.h = h
-        self.has_branches = nn.Linear(h, 1)
-        self.gamma_branch = nn.Linear(h, h * 2)
-        self.beta_branch = nn.Linear(h, h * 2)
+        self.has_branches = wn(nn.Linear(h, 1))
+        self.gamma_branch = wn(nn.Linear(h, h * 2))
+        self.beta_branch = wn(nn.Linear(h, h * 2))
         self.film = tcnn.FiLM()
         if kwargs.get('dr') is not None:
             self.dropout = nn.AlphaDropout(kwargs['dr'])
@@ -301,7 +323,7 @@ class ResidualGenerator(BatchGenerator):
             self.dropout = nn.AlphaDropout(kwargs['dr'])
 
     def generate(self, x, is_root=False, depth_cost=torch.FloatTensor([0.]), unk=1, *args, **kwargs):
-        #if is_root:
+        #if is_root:    
         #    self.global_state = x
         #    x = torch.zeros_like(self.global_state)
         #    #gamma, beta = self.condition(self.act(x)).chunk(2, dim=-1)#self.gamma(self.act(x)), self.beta(self.act(x))
@@ -347,14 +369,13 @@ class Encoder(nn.Module):
         super(Encoder, self).__init__()
         io, h = kwargs['io'], kwargs['h']
         self.act = kwargs['act']
-        self.batch = kwargs['batch']
         self.wd = kwargs['wd']
         self.h = h
-        self.embed = nn.Embedding(io, h)
-        self.conv1 = nn.Conv1d(h, h, 3, 1, 1)
-        self.conv2 = nn.Conv1d(h, h, 3, 1, 1)
-        self.conv3 = nn.Conv1d(h, h, 3, padding=(2*3 - 3 - (3-1)*(2-1)) + 1, dilation=2) 
-        self.conv4 = nn.Conv1d(h, h,  3, padding=(2*3 - 3 - (3-1)*(2-1)) + 1, dilation=2) 
+        self.embed = wn(nn.Embedding(io, h))
+        self.conv1 = wn(nn.Conv1d(h, h, 3, 1, 1))
+        self.conv2 = wn(nn.Conv1d(h, h, 3, 1, 1))
+        self.conv3 = wn(nn.Conv1d(h, h, 3, padding=(2*3 - 3 - (3-1)*(2-1)) + 1, dilation=2)) 
+        self.conv4 = wn(nn.Conv1d(h, h,  3, padding=(2*3 - 3 - (3-1)*(2-1)) + 1, dilation=2)) 
         if kwargs.get('adaptor'):
             self.adaptor = nn.Linear(h, kwargs['adaptor'])  
     def forward(self, x, aux=None, use_wd=True):
@@ -370,9 +391,9 @@ class Encoder(nn.Module):
             rw = None
         e = e.transpose(0,1).transpose(1,2)
         c1 = self.conv1(self.act(e))
-        c2 = self.conv2(self.act(c1)) + e
-        c3 = self.conv3(self.act(c2)) + c1
-        c4 = self.conv4(self.act(c3)) + c2
+        c2 = self.conv2(self.act(c1))
+        c3 = self.conv3(self.act(c2))
+        c4 = self.conv4(self.act(c3)) + e
         if aux is None:
             features = (c4).transpose(1,2).transpose(0,1)
             if hasattr(self, 'adaptor'):
@@ -411,7 +432,7 @@ class Classifier2(nn.Module):
         super(Classifier2, self).__init__()
         self.io, self.h, self.act = kwargs['io'], kwargs['h'], kwargs['act']
         self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
-        self.C = nn.Linear(self.h, self.io)
+        self.C = wn(nn.Linear(self.h, self.io))
     def forward(self, q, k):
         output, attn = zip(*[
             self.A(
@@ -432,8 +453,8 @@ class Copy(nn.Module):
             self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
         else:
             self.A = Attention(self.h)
-        self.V = nn.Linear(self.h, self.io)
-        self.C = nn.Linear(self.h, self.limit)
+        self.V = wn(nn.Linear(self.h, self.io))
+        self.C = wn(nn.Linear(self.h, self.limit))
     def forward(self, output, features, sizes):
         attn_output = self.act(self.A(output, features, sizes)[0])
         output = torch.cat([self.V(attn_output), self.C(attn_output)], dim=-1)

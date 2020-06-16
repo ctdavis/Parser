@@ -120,33 +120,6 @@ def print_tree(x, transform=lambda x: x, attr='terminal'):
     nx = Tree.fromstring(str(nx).replace('(','{').replace(')','}').replace('[','(').replace(']',')').replace('),',')'))
     nx.pretty_print()
 
-def pad(x, y, pad=None, force_continue=False):
-    if y.shape[0] < x.shape[0]:
-        diff = x.shape[0] - y.shape[0]
-        if len(y.shape) == 1:
-            y = F.pad(y, (0, diff), value=PAD)
-        elif len(y.shape) == 2:
-            y = F.pad(y, (0, 0, 0, diff))
-            if pad is not None:
-                y[diff + 1:,pad] = 1.
-        else:
-            y = F.pad(y, (0, 0, 0, 0, 0, diff))
-            if pad is not None:
-                y[diff + 1:,:,pad] = 1.
-    elif x.shape[0] < y.shape[0]:
-        diff = y.shape[0] - x.shape[0]
-        if len(x.shape) == 1:
-            x = F.pad(x, (0, diff), value=PAD)
-        elif len(x.shape) == 2:
-            x = F.pad(x, (0, 0, 0, diff))
-            if pad is not None:
-                x[diff+1:,pad] = 1.
-        else:
-            x = F.pad(x, (0, 0, 0, 0, 0, diff))
-            if pad is not None:
-                x[diff+1:,:,pad] = 1.
-    return x, y
-
 def get_vocab(d, l=0, pad=True):
     if not pad and l == 0:
         V = {}
@@ -243,8 +216,8 @@ def inspect_parsed_sentence_helper(_x, E, G, C, selector1, ds, ix, CL=None, outp
     encoding, _ = E(x)
     tree = G(G.act(encoding.sum(0)), sizes=[C.limit], return_trees=True)[0]
     leaves = G.get_leaves(tree)
-    leaves, _ = pad(define_padded_vectors(nn.utils.rnn.pad_sequence([leaves]), 0), torch.zeros((C.limit,1)))
-    leaves = C(leaves, encoding, sizes)
+    leaves = batch_data([leaves], 0, C.limit) #, _ = pad(define_padded_vectors(nn.utils.rnn.pad_sequence([leaves]), 0), torch.zeros((C.limit,1)))
+    leaves = C(leaves, act(encoding), sizes)
 
     tree = attach_to_leaves(tree, leaves, ds.vars['text'], C.io, G, _x if type(_x) != str else ds.vars[selector1]['preprocessor'](_x))
     if CL != None and output_set != None:
@@ -277,13 +250,16 @@ def inspect_parsed_sentence(s, ds, E, G, C, ix, selector, CL=None, output_set=No
         print(sent, subtrees[sent])
 
 
-def batch_data(x, pad, limit, emb=1):
+def batch_data(x, pad, limit, emb=1, use_pad_var=True):
     if x[0].dim() == 1:
         pad_vec = [torch.zeros(limit).long()]
         x = nn.utils.rnn.pad_sequence(list(x) + pad_vec, padding_value=pad)[:,:-1]
     else:
         pad_vec = [torch.zeros((limit, emb))]
-        x = define_padded_vectors(nn.utils.rnn.pad_sequence(list(x) + pad_vec), pad)[:,:-1,:]
+        if use_pad_var:
+            x = define_padded_vectors(nn.utils.rnn.pad_sequence(list(x) + pad_vec), pad)[:,:-1,:]
+        else:
+            x = nn.utils.rnn.pad_sequence(list(x) + pad_vec)[:,:-1,:]
     return x
 
 
@@ -308,7 +284,8 @@ class LanguageDataset(Dataset):
         if 'state_dict' in config:
             self.load_state_dict(config['state_dict'])
             return
-        df = config['source'][list(config['vars'].keys())]
+        df = config['source']#[[k for k in config['vars'].keys()]
+        df = df[[k for k in config['vars'].keys() if k in df.columns]]
         reserve = config.get('reserve')
         unify = config.get('unify')
         anchor = config.get('anchor')

@@ -31,18 +31,30 @@ def preprocessor(x, lower=True):
 def preprocess_sentiment(x):
     return [x]
 
+def preprocess_chars(x):
+    return [list(w) for w in preprocessor(x)]
+
 def size_fxn(context, x):
     return len(x)
 
 def target_fxn(context, x):
     return torch.LongTensor([len(context['vocab']) - (x + 1)])
 
-SAVE_DIR = './saved_models/06_15_01'
+def char_size_fxn(context, x):
+    return list(map(len, x))
 
-limit = 20
+def swish(x):
+    return x * torch.sigmoid(x)
+
+def mish(x):
+    return x * torch.tanh(F.softplus(x))
+
+SAVE_DIR = './saved_models/06_14_01'
+
+limit = 10
 config = {
     'len_limit': limit,
-    'sample_size': 6000,
+    'sample_size': 1000,
     'test_size': 128,
     'source': pd.read_csv('data/Tweets.csv'),
     'unify': ['text','airline_sentiment'], # unify vocabularies of each of these variables
@@ -50,11 +62,20 @@ config = {
     'anchor': 'text',
     'vars': {
         'text': {
-            'limit': 5, # retain a given word in vocab only if it occurs a number of times > limit
+            'limit': 4, # retain a given word in vocab only if it occurs a number of times > limit
             'pad': True,
             'preprocessor': preprocessor,
             'extra_fxns': {
                 'sizes': ('text', size_fxn) # create additional variable based on lengths of sentences in text
+             },
+        },
+        'chars': {
+            'source': 'text',
+            'limit': 1, # retain a given word in vocab only if it occurs a number of times > limit
+            'pad': True,
+            'preprocessor': preprocess_chars,
+            'extra_fxns': {
+                'sizes': ('text', char_size_fxn) # create additional variable based on lengths of sentences in text
              },
         },
         'airline_sentiment': {
@@ -109,19 +130,27 @@ model_config = {
     'dr': None,
 }
 
+char_config = {
+    'io': len(ds.vars['chars']['vocab']),
+    'h': h,
+    'act': act
+}
+
 classifier_config = deepcopy(model_config)
 classifier_config.update({ 'io': 3, 'n_heads': 1 })
 copy_config = deepcopy(model_config)
 copy_config.update({ 'n_heads': None })
 
 with open(f'{SAVE_DIR}/model_configs.pkl', 'wb') as f:
-    pickle.dump({ 'model': model_config, 'classifier': classifier_config, 'copy': copy_config }, f)
+    pickle.dump({ 'model': model_config, 'classifier': classifier_config, 'copy': copy_config, 'char': char_config }, f)
 
+charE = CharEncoder(**char_config)
 E = Encoder(**model_config)
 G = Generator(**model_config)
 C = Copy(**copy_config) # attention based module for choosing to either produce a vocab item or select word for source sentence
-CL = Classifier(**classifier_config) # attention based module for classifying sentiment
+CL = Classifier2(**classifier_config) # attention based module for classifying sentiment
 
+charE.apply(weight_init)
 E.apply(weight_init)
 G.apply(weight_init)
 C.apply(weight_init)
@@ -129,7 +158,7 @@ CL.apply(weight_init)
 
 C.V.weight.data = E.embed.weight
 
-optM = optim.AdamW(chain(E.parameters(), G.parameters(), C.parameters(), CL.parameters()), amsgrad=True)
+optM = optim.AdamW(chain(E.parameters(), G.parameters(), C.parameters(), CL.parameters(), charE.parameters()), amsgrad=True)
 
 for e in range(n_epochs):
 
@@ -142,6 +171,7 @@ for e in range(n_epochs):
     epoch_cl_loss = 0.
     epoch_cl_acc = 0.
 
+    charE.train()
     E.train()
     G.train()
     C.train()
@@ -149,24 +179,39 @@ for e in range(n_epochs):
 
     for ix, b in enumerate(batch_indices(ixs, batch_size, n_batches)): 
 
-        T, sizes, sentiment_target = zip(*[
+        T, sizes, sentiment_target, charT, char_sizes = zip(*[
             (
                 ds.vars['text']['vectors'][i],
                 ds.vars['text']['sizes'][i],
-                ds.vars['airline_sentiment']['target'][i]
+                ds.vars['airline_sentiment']['target'][i],
+                ds.vars['chars']['vectors'][i],
+                ds.vars['chars']['sizes'][i]
             )
             for i in b
         ])
-
         Targ = [torch.cat([w.unsqueeze(0) if w != 1 else torch.LongTensor([ix+model_config['io']]) for ix,w in enumerate(t)]) for t in T]
         sentiment_target = torch.cat(sentiment_target)
+
+        char_encodings = batch_data(
+            [
+                torch.cat([
+                    charE(F.one_hot(w,num_classes=len(ds.vars['chars']['vocab']))\
+                        .float().unsqueeze(0).transpose(1,2))
+                    for w in s
+                ])
+                for s in charT
+            ],
+            None,
+            limit,
+            use_pad_var=False
+        )
 
         T = batch_data(list(T), PAD, limit)
         Targ = batch_data(list(Targ), PAD, limit)
 
         optM.zero_grad()
 
-        features, _ = E(T) # encode sentences
+        features, _ = E(T, char_encodings) # encode sentences
 
         trees = G(act(features.sum(0)), sizes=[limit] * len(sizes), return_trees=True) # decode sentences as syntax trees
 
@@ -180,7 +225,8 @@ for e in range(n_epochs):
         ])
 
         # classify sentiments based on subtrees
-        sentiment, _ = CL([G.get_states(t).unsqueeze(1) for t in trees], act(E.embed(output_set)).unsqueeze(1)) 
+        sentiment, _ = CL([G.get_states(t).unsqueeze(1) for t in trees], [G.get_states(t).unsqueeze(1) for t in trees]) 
+        #act(E.embed(output_set)).unsqueeze(1)) 
 
         depths = torch.cat([d.sum(0,keepdim=True) for d in depths]).squeeze(1)
         states = torch.cat(states)
@@ -202,7 +248,7 @@ for e in range(n_epochs):
 
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(chain(E.parameters(), G.parameters(), C.parameters(), CL.parameters()), 1.)
+        torch.nn.utils.clip_grad_norm_(chain(E.parameters(), G.parameters(), C.parameters(), CL.parameters(), charE.parameters()), 1.)
 
         optM.step()
 
@@ -213,6 +259,7 @@ for e in range(n_epochs):
         epoch_gacc += (leaves.log_softmax(-1).argmax(-1) == Targ).long().float().mean().item()
         epoch_cl_acc += (sentiment.softmax(-1).argmax(-1) == sentiment_target).long().float().mean().item()
 
+    charE.eval()
     E.eval()
     G.eval()
     C.eval()
@@ -226,6 +273,7 @@ for e in range(n_epochs):
     tcl_acc = 0.
 
     test_words_data = ds.preprocess_new_observations('text', ds.test_df.text)
+    test_chars_data = ds.preprocess_new_observations('chars', ds.test_df.text)
     test_sentiment_data = ds.preprocess_new_observations('airline_sentiment', ds.test_df.airline_sentiment)
 
     for ix, tb in enumerate(batch_indices(tixs, batch_size, tn_batches)): 
@@ -235,11 +283,24 @@ for e in range(n_epochs):
             torch.cat([w.unsqueeze(0) if w != 1 else torch.LongTensor([ix+model_config['io']]) for ix,w in enumerate(t)])
             for t in [test_words_data['vectors'][i] for i in tb]
         ]
+        tchar_encodings = batch_data(
+            [
+                torch.cat([
+                    charE(F.one_hot(w,num_classes=len(ds.vars['chars']['vocab']))\
+                        .float().unsqueeze(0).transpose(1,2))
+                    for w in s
+                ])
+                for s in [test_chars_data['vectors'][i] for i in tb]
+            ],
+            None,
+            limit,
+            use_pad_var=False
+        )
         
         test_words = batch_data(list([test_words_data['vectors'][i] for i in tb]), PAD, limit)
         test_words_targ = batch_data(list(test_words_targ), PAD, limit)
 
-        test_features, _ = E(test_words)
+        test_features, _ = E(test_words, tchar_encodings)
 
         test_trees = G(act(test_features.sum(0)), sizes=[limit] * len([test_words_data['sizes'][i] for i in tb]), return_trees=True)
         tleaves, tdepths, tstates = zip(*[
@@ -251,7 +312,8 @@ for e in range(n_epochs):
             for t in test_trees
         ])
 
-        tsentiment, _ = CL([G.get_states(t).unsqueeze(1) for t in test_trees], act(E.embed(output_set)).unsqueeze(1))
+        tsentiment, _ = CL([G.get_states(t).unsqueeze(1) for t in test_trees], [G.get_states(t).unsqueeze(1) for t in test_trees])
+        #act(E.embed(output_set)).unsqueeze(1))
 
         tdepths = torch.cat([d.sum(0,keepdim=True) for d in tdepths]).squeeze(1)
         tstates = torch.cat(tstates)
@@ -269,8 +331,7 @@ for e in range(n_epochs):
         tgacc += (tleaves.log_softmax(-1).argmax(-1) == test_words_targ).long().float().mean().item()
         tcl_acc += (tsentiment.softmax(-1).argmax(-1) == tsentiment_target).long().float().mean().item()
 
-
-    features, _ = E(T[:, :1])
+    features, _ = E(T[:, :1], char_encodings[:, :1])
     trees = G(act(features.sum(0)), sizes=[limit], return_trees=True)
     leaves = batch_data([G.get_leaves(trees[0])], PAD, limit).contiguous()
     leaves = C(leaves, act(features), sizes[:1])
@@ -288,10 +349,12 @@ for e in range(n_epochs):
     print(f'Reconstruction of: {" ".join([w for w in ds.vars["text"]["text"][b[0]]])}')
     print(f'                   {" ".join([ds.vars["text"]["reverse_vocab"][w.item()] for w in T[:,0] if w.item() != 0])}')
     try:
-        inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, 0, 'text', CL, output_set, sizes=sizes[:1])
+        #inspect_parsed_sentence(ds.vars['text']['text'][b[0]], ds, E, G, C, 0, 'text', CL, output_set, sizes=sizes[:1])
+        print_tree(tree, lambda x: x, attr='attachment')
     except Exception as e:
         print(e)
     print()
+    torch.save(charE.state_dict(), f'{SAVE_DIR}/models/charE.pt')
     torch.save(E.state_dict(), f'{SAVE_DIR}/models/E.pt')
     torch.save(G.state_dict(), f'{SAVE_DIR}/models/G.pt')
     torch.save(C.state_dict(), f'{SAVE_DIR}/models/C.pt')
