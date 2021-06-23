@@ -120,17 +120,16 @@ for e in range(n_sentences):
         epoch_acc = 0.
         epoch_char_loss = 0.
         epoch_char_acc = 0.
-        epoch_fm = 0.
         examples = []
         epoch_cat = []
 
     # update model
-    (recon_loss, depth_loss, swd_loss, acc, fm_loss), (char_loss, char_depth, char_swd, char_acc) = compute_loss_and_acc(
+    (recon_loss, depth_loss, swd_loss, acc), (char_loss, char_depth, char_swd, char_acc) = compute_loss_and_acc(
         P, _d[0], c[0], model_config, ce=ce, mse=mse, discretization=model_config['discretize'], size=len(_d[0]), char_level=True
     )
-    loss = (recon_loss + depth_loss + swd_loss + char_loss + char_depth + char_swd) # + fm_loss
+    loss = (recon_loss + depth_loss + swd_loss + char_loss + char_depth + char_swd)
     #"""
-    if random.choice([True] + [False]): # regularize for parse consistency
+    if random.choice([True] + [False]): # consistency loss
         states0 = (lambda x: torch.cat([P.decoder.get_states(x), P.decoder.get_states(x, 'h')], dim=1))(P(_d[0], c[0])['tree'])
         states1 = (lambda x: torch.cat([P.decoder.get_states(x), P.decoder.get_states(x, 'h')], dim=1))(P(_d[0], c[0])['tree'])
         if len(states0) < len(states1):
@@ -139,8 +138,8 @@ for e in range(n_sentences):
             states1 = torch.cat([states1, torch.zeros((len(states0) - len(states1), states1.shape[-1]))])
         loss += mse(states0, states1)
     #"""
-    if random.choice([True] + [False] * 4):
-        if True:         
+    #"""
+    if random.choice([True] + [False] * 4): # clustering loss
         random_sample = data.sample(50).text.tolist()                    
         encodings = [
             st['state']
@@ -171,7 +170,7 @@ for e in range(n_sentences):
         cat_loss = torch.cat(cat_losses).mean() * 1.
         epoch_cat += [cat_loss.item()]
         loss += cat_loss
-
+    #"""
     loss.backward()
     opt.step()
     opt.zero_grad()
@@ -183,7 +182,6 @@ for e in range(n_sentences):
     epoch_acc += acc
     epoch_char_loss += char_loss.item()
     epoch_char_acc += char_acc
-    epoch_fm += 0.#fm_loss.item()
 
     examples += [[_d, c]]
 
@@ -196,7 +194,6 @@ for e in range(n_sentences):
         acc = round(epoch_acc / freq, 2) * 100
         char_loss = round(epoch_char_loss / freq, 3)
         char_acc = round(epoch_char_acc / freq, 2) * 100
-        fm = round(epoch_fm / freq, 3)
         cl = round(sum(epoch_cat) / len(epoch_cat), 3)
         
         test_dict = P(_d[0], c[0])
