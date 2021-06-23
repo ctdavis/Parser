@@ -1,52 +1,143 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-import torchcontrib.nn as tcnn
-import re
+import torchcontrib.nn as tnn
+
 import random
-import math
 
 from utils import *
 
 wn = torch.nn.utils.weight_norm
 
-class BatchGenerator(nn.Module):
+class CharacterEncoder(nn.Module):
     def __init__(self, *args, **kwargs):
-        super(BatchGenerator, self).__init__()
-        self.pad = kwargs['pad']
-    def forward(self, x, sizes, return_trees=False, context=None):
-        trees = []
-        if context is None:
-            for size, enc in zip(sizes, x.chunk(x.shape[0])):
-                self.source_size = size
-                self.max_steps = get_n_branches(size)
-                self.current_steps = 0
-                trees += [self.generate(enc, is_root=True)]
+        super(CharacterEncoder, self).__init__()
+        i, h = kwargs['char_i'], kwargs['h']
+        self.selu = nn.SELU()
+        self.conv0 = wn(nn.Conv1d(i, h, 3, 1, 1))
+        self.conv1 = wn(nn.Conv1d(h, h, 3, 1, 1))
+    def forward(self, x):
+        c0 = self.selu(self.conv0(x))
+        c1 = self.conv1(c0).sum(-1)
+        return c1
+        
+class CNNEncoder(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(CNNEncoder, self).__init__()
+        self.selu = nn.SELU()
+        self.char_encoder = CNNEncoder_(**kwargs)
+        self.word_encoder = CNNEncoder_(**kwargs)
+        self.char_decoder = ResidualGenerator(**kwargs['char_kwargs'])
+    def forward(self, x, characters=None, use_wd=True, add_end_mask=False, gen_chars=True):
+        char_encoding = torch.cat([
+            self.char_encoder(ch.transpose(1,2).squeeze(0).argmax(-1), use_wd=use_wd).mean(0,keepdim=True) # was .sum
+            for ch in characters
+        ])
+        encoding = self.word_encoder(x, char_encoding, use_wd=use_wd, add_end_mask=add_end_mask)
+        # producing words is used to regularize the model, 
+        # but it is not necessarily useful for a lot of inference use cases
+        if self.training and gen_chars:
+            char_trees = [
+                self.char_decoder(enc, size=l.shape[-1])
+                for enc,l in zip(encoding.chunk(len(encoding)), characters)
+            ]
+            char_trees = [
+                {
+                    'tree': t,
+                    'leaves': self.char_decoder.get_leaves(t),
+                    'depths': self.char_decoder.get_leaves(t, attr='depth'),
+                    'states': self.char_decoder.get_states(t)
+                }
+                for t in char_trees
+            ]
         else:
-            for size, enc, con in zip(sizes, x.chunk(x.shape[0]), context.chunk(context.shape[1], dim=1)):
-                self.source_size = size
-                self.max_steps = get_n_branches(size)
-                self.current_steps = 0
-                trees += [self.generate(enc, con, is_root=True)]
-        if return_trees:
-            return trees
+            char_trees = None
+        return encoding, char_trees
+        
+class CNNEncoder_(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(CNNEncoder_, self).__init__()
+        i, h = kwargs['i'], kwargs['h']
+        self.h = h
+        self.wd = kwargs['wd']
+        self.embed = wn(nn.Embedding(i, h))
+        self.conv0 = wn(nn.Conv1d(h, h, 3, 1, 1))
+        self.conv1 = wn(nn.Conv1d(h, h, 3, 1, 1))
+        self.selu = nn.SELU()
+        if kwargs.get('span_dropout') is not None:
+            self.span_dropout = span_dropout
+
+    def forward(self, x, characters=None, skip_embedding=False, use_wd=True, add_end_mask=False):
+        if skip_embedding:
+            e = x
         else:
-            leaves = nn.utils.rnn.pad_sequence(
-                [self.get_leaves(t) for t in trees],
-                padding_value=0
-            )
-            leaves = define_padded_vectors(leaves, self.pad)      
-            return leaves
-    def generate(self, x, is_root=True, *args, **kwargs):
+            e = self.embed(x)
+        if characters is not None:
+            e = e + characters
+        if self.training and self.wd and use_wd:
+            if hasattr(self, 'span_dropout'):
+                _e, (mask_ix, span_size) = self.span_dropout(e)
+                e, masked = _e, e[mask_ix:mask_ix+span_size]
+            else:
+                e = word_dropout(e.unsqueeze(1), self.wd).squeeze(1)
+                masked = None
+        if add_end_mask:
+            e = torch.cat([e, torch.zeros((2, self.h))])
+        e = e.view(1, self.h, -1)
+        c0 = self.conv0(self.selu(e))
+        c1 = self.conv1(self.selu(c0))
+        return c1.view(-1, self.h) + e.view(-1, self.h)
+
+
+class Generator(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(Generator, self).__init__()
+        self.h = kwargs['h']
+        self.i = kwargs['i']
+        h = self.h
+        i = self.i
+        reduction = h // (lambda x: 1 if x is None else x)(kwargs.get('reduction'))
+        if kwargs.get('char_level') is not None:
+            self.V = wn(nn.Linear(h, kwargs['o']))
+        self.reduction = reduction
+        self.hidden = wn(nn.Linear(h, h))
+        self.has_branches = wn(nn.Linear(reduction + h, 1))
+        self.controller = nn.GRUCell(h, reduction)
+        self.branch = wn(nn.Linear(h + reduction, h * 2))
+        self.selu = nn.SELU()
+        self._discretize = (lambda x: 0 if x is None else x)(kwargs.get('discretize'))
+
+    def forward(self, x, size=None):
+        if size is None:
+            self.max_steps = get_n_branches(x)
+        else:
+            self.max_steps = get_n_branches(size)
+        self.current_steps = 0
+        return self.generate(x, is_root=True)
+
+    def discretize(self, x):
+        if self._discretize == 0:
+            return x
+        return torch.cat([
+            x[:,:-self._discretize],
+            x[:,-self._discretize:].softmax(-1),
+        ], dim=-1)
+        
+    def generate(self, x, is_root=False, depth=0.):
         raise NotImplementedError
-    def get_leaves(self, x, attr='terminal', cat=True, extra_attrs=[None]):
+        
+    def get_leaves(self, x, attr='terminal', cat=True, extra_attrs=[None], allow_none=False, partial_tree=False):
         def descend(x):
-            if x['left'] == {}:
-                leaves.append(x[attr])
+            if not partial_tree and x['left'] == {}:
+                if allow_none:
+                    leaves.append(x.get(attr))
+                else:
+                    leaves.append(x[attr])
                 if type(extra_attrs) is list and extra_attrs[0] != None:
                     for a in extra_attrs:
                         leaves[-1] += ('_' + str(x[a]))
+            elif partial_tree and x == {}:
+                leaves.append(None)
             else:
                 descend(x['left'])
                 descend(x['right'])
@@ -55,136 +146,154 @@ class BatchGenerator(nn.Module):
         if cat:
             return torch.cat(leaves, dim=0)
         return leaves
-    def attach_to_leaves(self, x, attachment):
+    def attach_to_leaves(self, x, attachment, attachment_name='attachment', replace=False):
         attachment.reverse()
         def descend(x):
             if x['left'] == {} and attachment != []:
-                x['attachment'] = attachment.pop()
-            elif x['left'] == {} and attachment == []:
+                if replace:
+                    x.update(attachment.pop())
+                else:
+                    x[attachment_name] = attachment.pop()
+            elif attachment == []:
                 pass
             else:
                 descend(x['left'])
                 descend(x['right'])
         descend(x)
         return None
-
-    def get_states(self, x, leaves_only=False):
+    def get_states(self, x, attr='state', leaves_only=False):
         def descend(x):
             if x['left'] == {}:
-                leaves.append(x['state'])
+                leaves.append(x[attr])
             else:
                 if not leaves_only:
-                    leaves.append(x['state'])
+                    leaves.append(x[attr])
                 descend(x['left'])
                 descend(x['right'])
         leaves = []
         descend(x)
         return torch.cat(leaves, dim=0)
-    def get_leaves_from_subtrees(self, x, attr='terminal', cat=True):
+    def get_subtrees(self, x, sent_len, attr='ix', cat=False, leaves_only=False):
         def descend(x):
             if x['left'] == {}:
-                leaves.append(x[attr])
+                subtrees.append(x)
             else:
-                leaves.append(self.get_leaves(x, attr, cat))
+                if not leaves_only:
+                    subtrees.append(x)
                 descend(x['left'])
                 descend(x['right'])
-        leaves = []
+        subtrees = []    
+        self.attach_to_leaves(x, list(range(sent_len)), 'ix')
         descend(x)
-        return leaves
-    def add_vertices(self, x):
-        def descend(x, v):
+        return subtrees
+    def compute_bottom_up_fx(self, tree, fx):
+        def descend(x):
             if x['left'] == {}:
-                x['vertex'] = v[0]
+                return fx(torch.cat([x['h'], torch.zeros_like(x['h']), torch.zeros_like(x['h'])], dim=1))
             else:
-                x['vertex'] = v[0]
-                v[0] += 1
-                edges[0] += [[x['vertex'], v[0]]]
-                descend(x['left'], v)
-                v[0] += 1
-                edges[0] += [[x['vertex'], v[0]]]
-                descend(x['right'], v)
-        edges = [[]]
-        v = [0]
-        descend(x, v)
-        return edges[0]
-
-
-class CharEncoder(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(CharEncoder, self).__init__()
-        io, h = kwargs['io'], kwargs['h']
-        self.act = kwargs['act']
-        self.conv0 = wn(nn.Conv1d(io, h, 3, 1, 1))
-        self.conv1 = wn(nn.Conv1d(h, h, 3, 1, 1))
-    def forward(self, x):
-        c0 = self.act(self.conv0(x))
-        c1 = self.act(self.conv1(c0).sum(-1))
-        #c1 = torch.cat([c0, c1], dim=1)
-        return c1#.mean(-1)
-
-class Attention(nn.Module):
-    def __init__(self, dim, sm_over_context=True, double_linear_out=False):
-        super(Attention, self).__init__()
-        if double_linear_out is True:
-            self.double_linear_out = True
-            self.linear_out = wn(nn.Linear(dim*2, dim*2))
-        else:
-            self.double_linear_out = False
-            self.linear_out = wn(nn.Linear(dim*2, dim))
-        self.sm_over_context = sm_over_context
-    def forward(self, output, context, sizes=None):
-        if sizes is not None:
-            sizes = torch.FloatTensor([
-                [0 if i < s else 1 for i in range(context.shape[0])]
-                for s in sizes
-            ])
-        n_dims = output.dim()
-        if n_dims == 3:
-            output = output.transpose(0,1) # L x B x D -> B x L x D
-            context = context.transpose(0,1)
-        else:
-            output = output.unsqueeze(0) # L x D -> B x L x D 
-            context = context.unsqueeze(0) # L x D -> B x L x D
-        batch_size = output.size(0)
-        hidden_size = output.size(2)
-        input_size = context.size(1)
-        out_size = output.size(1)
-        # (batch, out_len, dim) * (batch, in_len, dim) -> (batch, out_len, in_len)
-        attn = torch.bmm(output, context.transpose(1, 2))
-        if sizes is not None:
-            attn = attn.transpose(0,1).masked_fill(sizes.bool(), False).transpose(0,1)
-            mask = ((attn != 0.).float() - 1) * 9999
-            attn = (attn + mask).contiguous()
+                left = descend(x['left'])
+                right = descend(x['right'])
+                return fx(torch.cat([left, x['h'], right], dim=1))
+        return descend(tree)
             
-        attn = F.softmax(
-            attn.view(-1, input_size if self.sm_over_context else out_size),
-            dim=1
-        ).view(batch_size, -1, input_size)
-     
-        # (batch, out_len, in_len) * (batch, in_len, dim) -> (batch, out_len, dim)
-        mix = torch.bmm(attn, context)
-
-        # concat -> (batch, out_len, 2*dim)
-        combined = torch.cat((mix, output), dim=2)
-
-        # output -> (batch, out_len, dim)
-        output = self.linear_out(combined.view(-1, 2 * hidden_size))\
-            .view(batch_size, -1, hidden_size * 2 if self.double_linear_out else hidden_size)
-        if n_dims == 3:
-            output = output.transpose(0,1)
-        else:
-            output = output.squeeze(0)
-        return output, attn
-
-class MultiheadAttention(nn.Module):
+class ResidualGenerator(Generator):
     def __init__(self, *args, **kwargs):
-        super(MultiheadAttention, self).__init__()
+        super(ResidualGenerator, self).__init__(**kwargs)
+        self.h = kwargs['h']
+        self.i = kwargs['i']
+        h = self.h
+        i = self.i
+        reduction = h // (lambda x: 1 if x is None else x)(kwargs.get('reduction'))
+        if kwargs.get('char_level') is not None:
+            self.V = wn(nn.Linear(h, kwargs['o']))
+        self.reduction = reduction
+        self.controller = nn.GRUCell(h, reduction)
+        self.has_branches = wn(nn.Linear(h + reduction, 1))
+        self.branch = wn(nn.Linear(h + reduction, h * 2))
+        self.selu = nn.SELU()
+        self.hidden = wn(nn.Linear(h, h))
+        self._discretize = (lambda x: 0 if x is None else x)(kwargs.get('discretize'))
+    def generate(self, x, is_root=False, depth=0.):
+        if is_root:
+           x = self.discretize(self.selu(self.hidden(self.selu(x)))).mean(0, keepdim=True)
+           h = torch.zeros((1, self.reduction))
+        else:
+           x, h = x
+        h = self.controller(x, h)
+        has_branches = self.has_branches(torch.cat([x, h], dim=-1))
+        if self.training:
+            has_branches = has_branches + torch.randn((1, 1))
+        has_branches = has_branches.sigmoid()
+        if has_branches < .5 or self.current_steps >= self.max_steps:
+            return {
+                'terminal': x if not hasattr(self, 'V') else self.V(x),
+                'state': x,
+                'h': h,
+                'depth': depth + has_branches,
+                'left': {},
+                'right': {}
+            }
+        self.current_steps += 2
+        left, right = self.selu(self.branch(torch.cat([x, h], dim=-1))).chunk(2, dim=-1)
+        left = self.discretize(x - self.selu(self.hidden(left)))
+        right = self.discretize(x - self.selu(self.hidden(right)))
+        if random.choice([0, 1]):
+            left_branch = self.generate([left, h], depth=depth + has_branches)
+            right_branch = self.generate([right, h], depth=depth + has_branches)
+            return {
+                'state': x,
+                'h': h,
+                'left': left_branch,
+                'right': right_branch
+            }
+        else:
+            right_branch = self.generate([right, h], depth=depth + has_branches)
+            left_branch = self.generate([left, h], depth=depth + has_branches)
+            return {
+                'state': x,
+                'h': h,
+                'left': left_branch,
+                'right': right_branch
+            }
+            
+class Copy(nn.Module):
+    """ Allows model to learn to copy unknown words from input to output based on their index in the input """
+    def __init__(self, *args, **kwargs):
+        super(Copy, self).__init__()
+        o, h = kwargs['i'], kwargs['h']
+        limit, n_heads = kwargs['limit'], kwargs['n_copy_heads']
+        self.h = h
+        self.selu = nn.SELU()
+        self.hidden = wn(nn.Linear(h, h))
+        reduction = h // (lambda x: 1 if x is None else x)(kwargs.get('reduction'))        
+        self.query0 = wn(nn.Conv1d(h + reduction, h, 3, 1, 1))
+        self.query1 = wn(nn.Conv1d(h, h, 3, 1, 1))
+        self.A = CustomMultiheadAttention(**{'h': h, 'n_heads':n_heads})
+        self.V = wn(nn.Linear(h, o))
+        self.C = wn(nn.Linear(h, limit))
+        self._discretize = (lambda x: 0 if x is None else x)(kwargs.get('discretize'))
+    def discretize(self, x):
+        if self._discretize == 0:
+            return x
+        return torch.cat([
+            x[:,:-self._discretize],
+            x[:,-self._discretize:].softmax(-1),
+        ], dim=-1)
+    def forward(self, o, f):
+        q = self.selu(self.query1(self.selu(self.query0(o.transpose(0,1).unsqueeze(0)))).transpose(1,2).transpose(0,1))
+        kv = self.discretize(self.selu(self.hidden(self.selu(f)))).unsqueeze(1)
+        ao = self.selu(self.A(q, kv, sizes=[len(f)])[0].squeeze(1))
+        out = torch.cat([self.V(ao), self.C(ao)], dim=-1)
+        return out
+
+class CustomMultiheadAttention(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(CustomMultiheadAttention, self).__init__()
         self.h, self.n_heads = kwargs['h'], kwargs['n_heads']
-        #self.act = kwargs['act']
         self.head_dim = self.h // self.n_heads
         assert self.h == self.head_dim * self.n_heads
         self.out = wn(nn.Linear(self.h * 2, self.h))
-    def forward(self, query, key, sizes=None, batch_first=False):
+    def forward(self, query, key, sizes=None, batch_first=False, return_scores_only=False, return_unnorm_scores=False, return_mix=False):
         if sizes is not None:
             sizes = torch.FloatTensor([
                 [0 if i < s else 1 for i in range(key.shape[1 if batch_first else 0])]
@@ -199,263 +308,68 @@ class MultiheadAttention(nn.Module):
         query = query.transpose(1,2)
         key = key.transpose(1,2)
         scores = torch.matmul(query, key.transpose(-2,-1)) / math.sqrt(self.head_dim)
-        #print(scores.shape, sizes.shape)
         if sizes is not None:
             scores = scores.permute(1,2,0,3).masked_fill(sizes == 1, -1e9).permute(2,0,1,3)
-        #print(scores)
+        _scores = scores
         scores = scores.softmax(-1)
         mix = torch.matmul(scores, key).view(b, -1, self.h)
+        #if return_mix:
+        #    return mix.transpose(0,1), scores
         if not batch_first:
             mix = mix.transpose(0,1)
             query = query.transpose(0,1).contiguous().view(-1, b, self.h) 
         output = self.out(torch.cat([mix, query], dim=2))
+        if return_unnorm_scores:
+            return output, scores, _scores
         return output, scores
 
-class MultiheadAttention2(nn.Module):
+class Parser(nn.Module):
     def __init__(self, *args, **kwargs):
-        super(MultiheadAttention2, self).__init__()
-        self.h, self.n_heads = kwargs['h'], kwargs['n_heads']
-        #self.act = kwargs['act']
-        self.head_dim = self.h // self.n_heads
-        assert self.h == self.head_dim * self.n_heads
-    def forward(self, query, key, value, sizes=None, batch_first=False):
-        if sizes is not None:
-            sizes = torch.FloatTensor([
-                [0 if i < s else 1 for i in range(key.shape[1 if batch_first else 0])]
-                for s in sizes
-            ])
-        if not batch_first:
-            query = query.transpose(0,1)
-            key = key.transpose(0,1)
-            value = value.transpose(0,1)
-        b = query.shape[0]
-        query = query.view(b, -1, self.n_heads, self.head_dim)
-        key = key.view(b, -1, self.n_heads, self.head_dim)
-        value = value.view(b, -1, self.n_heads, self.head_dim)
-        query = query.transpose(1,2)
-        key = key.transpose(1,2)
-        value = value.transpose(1,2)
-        scores = torch.matmul(query, key.transpose(-2,-1)) / math.sqrt(self.head_dim)
-        #print(scores.shape, sizes.shape)
-        if sizes is not None:
-            scores = scores.permute(1,2,0,3).masked_fill(sizes == 1, -1e9).permute(2,0,1,3)
-        #print(scores)
-        scores = scores.softmax(-1)
-        #mix = torch.matmul(scores, key).view(b, -1, self.h)
-        mix = torch.matmul(scores, value).view(b, -1, self.h)
-        if not batch_first:
-            mix = mix.transpose(0,1)
-            query = query.transpose(0,1).contiguous().view(-1, b, self.h) 
-        #output = self.out(torch.cat([mix, query], dim=2))
-        output = mix
-        return output, scores
+        super(Parser, self).__init__()
+        self.h, self.limit = kwargs['h'], kwargs['limit']
+        self.selu = nn.SELU()
+        self.encoder = CNNEncoder(**kwargs)
+        self.decoder = ResidualGenerator(**kwargs)
+        self.copy = Copy(**kwargs)
+        self.decoder.hidden.weight.data = self.copy.hidden.weight.data
+        self.encoder.word_encoder.embed.weight.data = self.copy.V.weight.data
+        self.encoder.char_encoder.embed.weight.data = self.encoder.char_decoder.V.weight.data
+        #self.encoder.word_encoder.conv0.weight.data = self.copy.query0.weight.data
+        #self.encoder.word_encoder.conv1.weight.data = self.copy.query1.weight.data
+        self._discretize = (lambda x: 0 if x is None else x)(kwargs.get('discretize'))
+        self.span_dropout = kwargs.get('span_dropout')
+        self.out = wn(nn.Linear(self.h, 2))
+        
+    def discretize(self, x):
+        if self._discretize == 0:
+            return x
+        return torch.cat([
+            x[:,:-self._discretize],
+            x[:,-self._discretize:].softmax(-1),
+        ], dim=-1)
 
-class Generator(BatchGenerator):
-    def __init__(self, *args, **kwargs):
-        super(Generator, self).__init__(*args, **kwargs)
-        o, h = kwargs['io'], kwargs['h']
-        self.act = kwargs['act']
-        self.o = o
-        self.h = h
-        self.has_branches = wn(nn.Linear(h, 1))
-        self.gamma_branch = wn(nn.Linear(h, h * 2))
-        self.beta_branch = wn(nn.Linear(h, h * 2))
-        self.film = tcnn.FiLM()
-        if kwargs.get('dr') is not None:
-            self.dropout = nn.AlphaDropout(kwargs['dr'])
-
-    def generate(self, x, is_root=False, depth_cost=torch.FloatTensor([0.]), unk=1, *args, **kwargs):
-        if is_root:
-            self.global_state = x
-            x = torch.zeros_like(self.global_state)
-            #gamma, beta = self.condition(self.act(x)).chunk(2, dim=-1)#self.gamma(self.act(x)), self.beta(self.act(x))
-            _, gamma = self.act(self.gamma_branch(x)).chunk(2, dim=1)
-            _, beta = self.act(self.beta_branch(x)).chunk(2, dim=1)
-            x = self.act(self.film(self.global_state, gamma, beta))
-        if hasattr(self, 'dropout') and self.training:
-            x = self.dropout(x)
-        has_branches = self.has_branches(x).sigmoid()
-        if (has_branches.item() < .5) or (self.current_steps >= self.max_steps):
-            return {
-                'terminal': x,
-                'left': {},
-                'right': {},
-                'depth': depth_cost + has_branches,
-                'state': x,
-            }
+    def forward(self, x, characters=None, size=None, use_wd=True, skip_encoding=None, gen_chars=False):
+        if skip_encoding is not None:
+            encoding = x
         else:
-            self.current_steps += 2
-            left_gamma, right_gamma = self.act(self.gamma_branch(x)).chunk(2, dim=1)
-            left_beta, right_beta = self.act(self.beta_branch(x)).chunk(2, dim=1)
-            left = self.act(self.film(self.global_state, left_gamma, left_beta))
-            right = self.act(self.film(self.global_state, right_gamma, right_beta))
-            if random.choice([True, False]):
-                left_branch = self.generate(left, depth_cost=depth_cost+has_branches, *args, **kwargs)
-                right_branch = self.generate(right, depth_cost=depth_cost+has_branches, *args, **kwargs)
-            else:
-                right_branch = self.generate(right, depth_cost=depth_cost+has_branches, *args, **kwargs)
-                left_branch = self.generate(left, depth_cost=depth_cost+has_branches, *args, **kwargs)
-            return {
-                'state': x,
-                'left': left_branch,
-                'right': right_branch,
-            }
-
-class ResidualGenerator(BatchGenerator):
-    def __init__(self, *args, **kwargs):
-        super(ResidualGenerator, self).__init__(*args, **kwargs)
-        o, h = kwargs['io'], kwargs['h']
-        self.act = kwargs['act']
-        self.o = o
-        self.h = h
-        self.has_branches = nn.Linear(h, 1)
-        self.hidden = nn.Linear(h, h)
-        #self.gamma_branch = nn.Linear(h, h * 2)
-        #self.beta_branch = nn.Linear(h, h * 2)
-
-        #self.gamma = nn.Linear(h, h)
-        #self.beta = nn.Linear(h, h)
-        #self.condition = nn.Linear(h, h * 2)
-        self.branch = nn.Linear(h, h * 2)
-
-        #self.film = tcnn.FiLM()
-        if kwargs.get('dr') is not None:
-            self.dropout = nn.AlphaDropout(kwargs['dr'])
-
-    def generate(self, x, is_root=False, depth_cost=torch.FloatTensor([0.]), unk=1, *args, **kwargs):
-        #if is_root:    
-        #    self.global_state = x
-        #    x = torch.zeros_like(self.global_state)
-        #    #gamma, beta = self.condition(self.act(x)).chunk(2, dim=-1)#self.gamma(self.act(x)), self.beta(self.act(x))
-        #    _, gamma = self.act(self.gamma_branch(x)).chunk(2, dim=1)
-        #    _, beta = self.act(self.beta_branch(x)).chunk(2, dim=1)
-        #    x = self.act(self.film(self.global_state, gamma, beta))
-        if hasattr(self, 'dropout') and self.training:
-            x = self.dropout(x)
-        has_branches = self.has_branches(x).sigmoid()
-        if (has_branches.item() < .5) or (self.current_steps >= self.max_steps):
-            return {
-                'terminal': x,
-                'left': {},
-                'right': {},
-                'depth': depth_cost + has_branches,
-                'state': x,
-            }
+            encoding, char_trees = self.encoder(x, characters, use_wd=use_wd, gen_chars=gen_chars)
+        tree = self.decoder(encoding, size=size)
+        hs = self.decoder.get_leaves(tree, attr='h')
+        leaves = self.decoder.get_leaves(tree)
+        if skip_encoding is not None:
+            leaves_after_copy = self.copy(leaves, skip_encoding)
         else:
-            self.current_steps += 2
-            left, right = self.branch(x).chunk(2, dim=1)
-            #left_gamma, right_gamma = self.act(self.gamma_branch(x)).chunk(2, dim=1)
-            #left_beta, right_beta = self.act(self.beta_branch(x)).chunk(2, dim=1)
-            left, right = x - self.act(self.hidden(self.act(left))), x - self.act(self.hidden(self.act(right)))
-            #left_gamma, left_beta = self.condition(self.act(left)).chunk(2, dim=-1) #self.gamma(self.act(left)), self.beta(self.act(left))
-            #right_gamma, right_beta = self.condition(self.act(right)).chunk(2, dim=-1) #self.gamma(self.act(right)), self.beta(self.act(right))
-            
-            #left = self.act(self.film(self.global_state, left_gamma, left_beta))
-            #right = self.act(self.film(self.global_state, right_gamma, right_beta))
-            if random.choice([True, False]):
-                left_branch = self.generate(left, depth_cost=depth_cost+has_branches, *args, **kwargs)
-                right_branch = self.generate(right, depth_cost=depth_cost+has_branches, *args, **kwargs)
-            else:
-                right_branch = self.generate(right, depth_cost=depth_cost+has_branches, *args, **kwargs)
-                left_branch = self.generate(left, depth_cost=depth_cost+has_branches, *args, **kwargs)
-            return {
-                'state': x,
-                'left': left_branch,
-                'right': right_branch,
-            }
-
-class Encoder(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(Encoder, self).__init__()
-        io, h = kwargs['io'], kwargs['h']
-        self.act = kwargs['act']
-        self.wd = kwargs['wd']
-        self.h = h
-        self.embed = wn(nn.Embedding(io, h))
-        self.conv1 = wn(nn.Conv1d(h, h, 3, 1, 1))
-        self.conv2 = wn(nn.Conv1d(h, h, 3, 1, 1))
-        self.conv3 = wn(nn.Conv1d(h, h, 3, padding=(2*3 - 3 - (3-1)*(2-1)) + 1, dilation=2)) 
-        self.conv4 = wn(nn.Conv1d(h, h,  3, padding=(2*3 - 3 - (3-1)*(2-1)) + 1, dilation=2)) 
-        if kwargs.get('adaptor'):
-            self.adaptor = nn.Linear(h, kwargs['adaptor'])  
-    def forward(self, x, aux=None, use_wd=True):
-        if self.training and self.wd is not None and use_wd is True:
-            e = self.embed(x)
-            if aux is not None:
-                e = e + aux
-            e, rw = word_dropout(e, dropout=self.wd)
-        else:
-            e = self.embed(x)
-            if aux is not None:
-                e = (e + aux)
-            rw = None
-        e = e.transpose(0,1).transpose(1,2)
-        c1 = self.conv1(self.act(e))
-        c2 = self.conv2(self.act(c1))
-        c3 = self.conv3(self.act(c2))
-        c4 = self.conv4(self.act(c3)) + e
-        if aux is None:
-            features = (c4).transpose(1,2).transpose(0,1)
-            if hasattr(self, 'adaptor'):
-                features = self.adaptor(self.act(features.mean(0)))
-            else:
-                features = features#.sum(0)
-        else:
-            features = (c4).transpose(1,2).transpose(0,1)#.sum(0)
-        return features, rw
-
-class Classifier(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(Classifier, self).__init__()
-        self.io, self.h = kwargs['io'], kwargs['h']
-        self.act = kwargs['act']
-        if kwargs.get('n_heads') is not None:
-            self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
-            #self.value = nn.Linear(self.h, self.h)
-            #self.A = MultiheadAttention2(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
-        else:
-            self.A = Attention(self.h)
-        self.C = nn.Linear(self.io * self.h, self.io)
-    def forward(self, states, output_set):
-        output, attn = zip(*[
-            self.A(
-                output_set,
-                state
-                #self.act(self.value(state))
-            )
-            for state in states
-        ])
-        return torch.cat([self.C(self.act(o).view(1, -1)) for o in output]), attn
-
-class Classifier2(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(Classifier2, self).__init__()
-        self.io, self.h, self.act = kwargs['io'], kwargs['h'], kwargs['act']
-        self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
-        self.C = wn(nn.Linear(self.h, self.io))
-    def forward(self, q, k):
-        output, attn = zip(*[
-            self.A(
-                q_state,
-                k_state,
-            )
-            for q_state, k_state in zip(q, k)
-        ])
-        return torch.cat([self.C(self.act(o).max(0)[0]) for o in output]), attn
-
-class Copy(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(Copy, self).__init__()
-        self.io, self.h = kwargs['io'], kwargs['h']
-        self.act = kwargs['act']
-        self.limit = kwargs['limit']
-        if kwargs.get('n_heads') is not None:
-            self.A = MultiheadAttention(**{'h': self.h, 'n_heads': kwargs['n_heads'] })
-        else:
-            self.A = Attention(self.h)
-        self.V = wn(nn.Linear(self.h, self.io))
-        self.C = wn(nn.Linear(self.h, self.limit))
-    def forward(self, output, features, sizes):
-        attn_output = self.act(self.A(output, features, sizes)[0])
-        output = torch.cat([self.V(attn_output), self.C(attn_output)], dim=-1)
-        return output
+            leaves_after_copy = self.copy(torch.cat([leaves, hs], dim=-1), encoding)#
+        depths = self.decoder.get_leaves(tree, attr='depth')
+        states = self.decoder.get_states(tree)
+        hs = self.decoder.get_states(tree, attr='h')
+        return {
+            'encoding': encoding,
+            'tree': tree,
+            'leaves': leaves,
+            'leaves_after_copy': leaves_after_copy,
+            'depths': depths,
+            'states': states,
+            'char_trees': char_trees,
+            'hs': hs,
+        }

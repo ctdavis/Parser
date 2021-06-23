@@ -1,23 +1,511 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset
+from torch.distributions.bernoulli import Bernoulli
 
-import pandas as pd
+from typing import Union, List
 import numpy as np
 import math
-import re
 import random
-from itertools import chain
-from functools import partial, reduce
-from collections import Counter
 from nltk.tree import Tree
-from nltk.tokenize import sent_tokenize
-from torch.distributions.bernoulli import Bernoulli
-import requests
-from bs4 import BeautifulSoup
-from time import sleep
+import re
+from collections import Counter
+from itertools import chain
+import pandas as pd
+import pickle
+import nltk
+
+def get_n_branches(x):
+    if type(x) is int:
+        return x * 2 - 2
+    return len(x) * 2 - 2
+
+def expected_depth(x, mode='sum'):
+    return torch.FloatTensor([
+        (math.sqrt(x)) if mode != 'sum' else ((math.sqrt(x)) * (x)) # last sigmoid activation on a given branch should be < .5
+    ])
+
+def word_dropout(x, dropout=0.2, max_retries=5):
+    if x.shape[0] < 3:
+        dropout = 0.1
+    retries = 0
+    rw = Bernoulli(1. - dropout).sample(x.shape[:-1])
+
+    while rw.sum().item() == 0. and retries < max_retries:
+        rw = Bernoulli(1. - dropout).sample(x.shape[:-1])
+        retries += 1
+    if retries >= max_retries and rw.sum().item() == 0.:
+        return x
+    rw = rw.unsqueeze(2).repeat(1, 1, x.shape[-1])
+    return rw * x
+    
+def span_dropout(x, dropout=0.15):
+    if len(x) == 1:
+        return x
+    span_size = torch.poisson(torch.ones(1,1)).long().item() #random.choice(range(min(4, len(x))))
+    if span_size == 0 or span_size > (len(x) - 1):
+        return x
+    mask_ix = random.choice(range(len(x)))
+    return torch.cat([
+        x[:mask_ix],
+        torch.zeros((1, x.shape[-1])),
+        x[mask_ix+span_size:],
+    ]), (mask_ix, span_size)
+
+
+def axe_recon_loss(leaves, target, p=4.0):
+    return axe_loss(
+        torch.cat([
+            leaves.unsqueeze(0),
+            torch.zeros((1, 1, leaves.shape[-1]))
+        ], dim=1),
+        torch.LongTensor((len(leaves),)),
+        target.unsqueeze(0),
+        torch.LongTensor((len(target),)),
+        0,
+        p
+    )
+
+def flatten(x):
+    leaves = []
+    def fxn(_x):
+        if type(_x) is str:
+            leaves.append(_x)
+        else:
+            fxn(_x[0])
+            if len(_x) == 2:
+                fxn(_x[1])
+    fxn(x)
+    return leaves
+
+def vocab_encoder(V, s):
+    return torch.LongTensor([0 if w not in V else V[w] for w in s])
+
+def pad_to_match_length(x, y):
+    if len(x) < len(y):
+        diff = len(y) - len(x)
+        if x.ndim == 2:
+            return torch.cat([x, torch.zeros((diff, x.shape[-1]))]), y
+        else:
+            return torch.cat([x, torch.zeros((diff,)).long()]), y
+    elif len(x) > len(y):
+        diff = len(x) - len(y)
+        return x, torch.cat([y, torch.zeros((diff,)).long()])
+    return x, y
+
+def create_target(x, o):
+    return torch.cat([
+        w.unsqueeze(0) if w != 1 else torch.LongTensor([ix+o])
+        for ix,w in enumerate(x)
+    ])
+
+def accuracy(x, y):
+    return (x.softmax(-1).argmax(-1) == y).long().float().mean().item()
+
+def print_tree(x, transform=lambda x: x, attr='terminal'):
+    nx = [None]
+    def fx(x, nx):
+        if x['left'] == {}:
+            if attr is not None:
+                nx[0] = transform(x[attr])
+            else:
+                nx[0] = transform(x)
+        else:
+            nx[0] = [None]
+            nx += [[None]]
+            fx(x['left'], nx[0])
+            fx(x['right'], nx[1])
+    fx(x, nx)
+    nx = Tree.fromstring(str(nx).replace('(','{').replace(')','}').replace('[','(').replace(']',')').replace('),',')'))
+    nx.pretty_print()
+
+def attach_to_leaves(tree, leaves, V, io, G, source):
+    leaves = [
+        w if w not in V else V[w].replace('[','{').replace(']','}')
+        for w in leaves.squeeze(1).softmax(-1).argmax(-1).tolist()
+    ]
+    for leaf_ix, leaf in enumerate(leaves):
+        if type(leaf) != str:
+            a = leaf - io
+            if a < len(source):
+                leaves[leaf_ix] = source[a]
+            else:
+                leaves[leaf_ix] = str(a)
+
+    G.attach_to_leaves(tree, leaves)
+    return tree
+
+def parse_sentence(x, ds, P, model_config, add_end_mask=False, _print_tree=True, return_encoding=False):
+    _d, c, d = ds.preprocess(pd.DataFrame.from_dict({'text': [x]}), ['text'], flatten=True)['text'][0]
+    parse_dict = P(_d[0], c[0])#, add_end_mask=add_end_mask)
+    if return_encoding:
+        return parse_dict['encoding']
+    tree = attach_to_leaves(parse_dict['tree'], parse_dict['leaves_after_copy'], ds.vrs['text']['rV'], model_config['i'], P.decoder, d[0])
+    if _print_tree:
+        print_tree(tree, lambda x: x, attr='attachment')
+    return tree
+
+def get_characters(tree, leaves, ds, model_config, G, source):
+    tree = attach_to_leaves(tree, leaves, ds.vrs['text']['rV'], model_config['i'], G, source)
+    attachment = G.get_leaves(tree, cat=False, attr='attachment')
+    return leaves, attachment, [torch.cat(c, dim=-1) for c in ds.character_encoder(ds.vrs['text']['cV'], lambda x: x, attachment)]
+
+def preprocessor(x, lower=True):
+    def remove_extra_space(x):
+        return re.sub(r'\s{2,}', r' ', x)
+    x = re.sub(r'([A-Z][a-z]{,2})\. ([A-Z])', r'\1 \2', x) # capture titles such as Dr.
+    x = re.sub(r'([bd])\.', r'\1 ', x) # capture birth and death dates from wiki articles
+    x = re.sub(r'(\[ \d+ \]|\[\d+\])', r'', x)
+    x = re.sub(r'(Late|Cancel)(\w*) Flight(\w*)', r'\1\3', x)
+    if lower:
+        x = x.lower()
+        
+    x = re.sub(r'&amp;', 'and', x)
+    x = re.sub(r'&gt;', '>', x)
+    x = re.sub(r'&lt;', '<', x)
+    x = re.sub(r'(http\S+)',r'<u>',x)
+    x = re.sub(r'(\D)\1{2,}', r'\1', x)
+    x = re.sub(r'(\W)', r' \1 ', x)
+    x = re.sub(r'(\d) (\.|-|/) (\d)', r'\1\2\3', x)
+    x = re.sub(r'(#|@) (\S)', r'\1\2', x)
+    x = re.sub(r'< u >', r'<u>', x)
+    x = remove_extra_space(x)
+    x = re.sub(r'(\?) (!)', r'\1\2', x)
+    x = re.sub(r'(!) (\?)', r'\1\2', x)
+    x = re.sub(r'(!\?|\?!)+', r'?', x)
+    x = re.sub(r'\.{2,}', r'.', x)
+    return [remove_extra_space(s.strip()).split(' ') for s in nltk.sent_tokenize(x) if s.strip().split(' ') != [' '] and 'mw - parse' not in s]
+
+def compute_loss_and_acc(P, d, c, model_config, ce=nn.CrossEntropyLoss(), mse=nn.MSELoss(), use_wd=True, size=None, discretization=0, gon=None, char_level=False):
+    t = create_target(d, model_config['o'])
+
+    # forward pass
+    parse_dict = P(d, c, use_wd=use_wd, size=size, gen_chars=char_level)
+
+    # unpack and post process
+    tree = parse_dict['tree']
+    leaves = parse_dict['leaves_after_copy']
+    depth = parse_dict['depths']
+    states = parse_dict['states']
+    _leaves, t = pad_to_match_length(leaves, t)
+    
+    if char_level:
+    
+        char_trees = parse_dict['char_trees']
+        char_ce = torch.cat([axe_recon_loss(pad_to_match_length(l['leaves'], _c.transpose(1,2).squeeze(0).argmax(-1))[0],_c.transpose(1,2).squeeze(0).argmax(-1), 2.).view(1, 1) for l,_c in zip(char_trees, c)]).mean(0, keepdim=True)
+        char_depth = torch.cat([mse(l['depths'].sum(0), expected_depth(_c.shape[-1], mode='sum')).view(1,1) * 1. for l,_c in zip(char_trees, c)]).mean(0, keepdim=True)
+        char_swd = torch.cat([sliced_wasserstein_distance(l['states']).view(1,1) * 0.01 for l,_c in zip(char_trees, c)]).mean(0, keepdim=True)#[:,:-discretization]
+        char_acc = [accuracy(pad_to_match_length(l['leaves'], _c.transpose(1,2).squeeze(0).argmax(-1))[0].detach(), _c.transpose(1,2).squeeze(0).argmax(-1)) for l,_c in zip(char_trees, c)]
+
+    # calculate loss and acc
+    recon_loss = axe_recon_loss(_leaves, t, 2.) #ce(_leaves, t) * 1.
+    depth_loss = mse(depth.sum(0), expected_depth(len(d), mode='sum')) * 0.01 # was changed from .0005, where performance was generally very good
+    swd_loss = sliced_wasserstein_distance(states) * 1.#
+    acc = accuracy(_leaves.detach(), t)
+    
+    if char_level:
+        return (recon_loss, depth_loss, swd_loss, acc), (char_ce, char_depth, char_swd, sum(char_acc)/len(char_acc))
+
+    return (recon_loss, depth_loss, swd_loss, acc, fm_loss), (0., 0., 0., 0.)
+
+class Dataset:
+    def __init__(self, config, saved_variables=None):
+        if saved_variables is not None:
+            self.load_variables(saved_variables)
+        else:
+            self.df = config['df']
+            self.vrs = config['vrs']
+            self.limit = config['limit']
+            for k in self.vrs:
+                self.create_variable(k)
+    def load_variables(self, vrs):
+        self.vrs = { k: {} for k in vrs.keys() if k not in ['limit', 'df'] }
+        self.limit = vrs['limit']
+        for v in vrs.keys():
+            if v in ['limit','df']:
+                continue
+            self.vrs[v]['preprocessor'] = vrs[v]['preprocessor']
+            self.vrs[v]['V'] = vrs[v]['V']
+            self.vrs[v]['cV'] = vrs[v]['cV']
+            self.vrs[v]['rV'] = vrs[v]['rV']
+    def create_variable(self, v):
+        name = v
+        v = self.vrs[v]
+        preprocessor = v['preprocessor']
+        vocab_min_freq= v['vocab_min_freq']
+        char_min_freq = v['char_min_freq']
+        V = v['base_vocab']
+        lV = len(list(V.keys()))
+        if v['rank'] is None:
+            _V = {
+                w:(ix+lV)
+                for ix,w in enumerate([
+                    k for k,f in Counter(chain(*[s for s in chain(*self.df[v['reference']].map(preprocessor)) if len(s) <= self.limit])).items() if (f >= vocab_min_freq and k.islower()) # k.lower() avoids duplicate words that differ only the use of uppercase letters and discourages proper nouns
+                ])
+            }
+        else:
+            _V = list(reversed(sorted(
+                Counter(chain(*[s for s in chain(*self.df[v['reference']].map(preprocessor)) if len(s) <= self.limit])).items(),
+                key=lambda x: x[1]
+            )))
+            cutoff = round(len(_V) * v['rank'])
+            _V = {w:(ix+lV) for ix,(w,_) in enumerate(_V[:cutoff])}
+        V.update(_V)
+        cV = { '<unk>': 0 }
+        cV.update({
+            c:(ix+1)
+            for ix,c in enumerate([
+                k for k,f in Counter(chain(*chain(*[s for s in chain(*self.df[v['reference']].map(preprocessor)) if len(s) <= self.limit]))).items() if f >= char_min_freq
+            ])
+        })
+        rV = {ix:w for w,ix in V.items()}
+        self.vrs[name]['V'], self.vrs[name]['cV'], self.vrs[name]['rV'], self.vrs[name]['reference'] = V, cV, rV, v['reference']
+    
+
+    def preprocess(self, data, vs, flatten=False, embedder=None, use_reference=False):
+        if len(vs) > 1:
+            flatten = False
+        output = {}
+        for ix, v in enumerate(vs):
+            name = v
+            v = self.vrs[v]
+            reference = v['reference'] if use_reference else name
+            words = [ self.word_encoder(v['V'], v['preprocessor'], s, embedder=(None if embedder is None else embedder[1] if embedder[0] == name else None)) for s in data.iloc[:,ix] ]
+            characters = [ self.character_encoder(v['cV'], v['preprocessor'], s) for s in data.iloc[:,ix] ]
+            if flatten:
+                words = map(lambda x: [x], chain(*words))
+                characters = map(lambda x: [x], chain(*characters))
+                data = map(lambda x: [x], chain(*map(v['preprocessor'], data.iloc[:,ix])))
+                output[reference] = [o for o in zip(words, characters, data) if len(o[0][0]) <= self.limit]
+            else:
+                # following lines require that length limiting variable must be first in list of vrs
+                if ix == 0:
+                    tmp = [(ii,o) for ii,o in enumerate(zip(words, characters, data.iloc[:,ix])) if len(o[0][0]) <= self.limit]
+                    ixs, _data = zip(*tmp)
+                    output[reference] = _data
+                else:
+                    output[reference] = [o for ii,o in enumerate(zip(words, characters, data.iloc[:,ix])) if ii in ixs]
+        return output
+        
+    def word_encoder(self, V, p, s, embedder):
+        if embedder is not None:
+            return [
+                torch.cat([embedder(w) for w in _s])
+                for _s in p(s)
+            ]
+        return [
+            torch.LongTensor([1 if w not in V else V[w] for w in _s])
+            for _s in p(s)
+        ]
+
+    def character_encoder(self, V, p, s):
+        return [
+            [
+                F.one_hot(
+                    torch.LongTensor([0 if c not in V else V[c] for c in w]),
+                    num_classes=len(V)
+                ).float().unsqueeze(0).transpose(1,2)
+                for w in _s
+            ]
+            for _s in p(s)
+        ]
+        
+def save_parser(parser, optimizer, var, model_config, df, path):
+    df.to_pickle(path + '/df.pkl')
+    with open(path + '/V.pkl', 'wb') as f:
+        pickle.dump(var['V'], f)
+    with open(path + '/cV.pkl', 'wb') as f:
+        pickle.dump(var['cV'], f)
+    with open(path + '/rV.pkl', 'wb') as f:
+        pickle.dump(var['rV'], f)
+    with open(path + '/model_config.pkl', 'wb') as f:
+        pickle.dump(model_config, f)
+    torch.save(parser.state_dict(), path + '/model.pt')
+    torch.save(parser.state_dict(), path + '/optimizer.pt')
+
+
+# other people's code below
+
+def axe_loss(logits: torch.FloatTensor,
+             logit_lengths: torch.Tensor,
+             targets: torch.LongTensor,
+             target_lengths: torch.Tensor,
+             blank_index: torch.LongTensor,
+             delta: torch.FloatTensor,
+             reduction: str = 'mean',
+             label_smoothing: float = None,
+             return_a: bool = False
+            ) -> Union[torch.FloatTensor, List[torch.Tensor]]:
+    """Aligned Cross Entropy
+    Marjan Ghazvininejad, Vladimir Karpukhin, Luke Zettlemoyer, Omer Levy, in arXiv 2020
+    https://arxiv.org/abs/2004.01655
+    Computes the aligned cross entropy loss with parallel scheme.
+    Parameters
+    ----------
+    logits : ``torch.FloatTensor``, required.
+        A ``torch.FloatTensor`` of size (batch_size, sequence_length, num_classes)
+        which contains the unnormalized probability for each class.
+    logit_lengths : ``torch.Tensor``, required.
+        A ``torch.Tensor`` of size (batch_size,)
+        which contains lengths of the logits
+    targets : ``torch.LongTensor``, required.
+        A ``torch.LongTensor`` of size (batch, sequence_length) which contains the
+        index of the true class for each corresponding step.
+    target_lengths : ``torch.Tensor``, required.
+        A ``torch.Tensor`` of size (batch_size,)
+        which contains lengths of the targets
+    blank_index : ``torch.LongTensor``, required.
+        A ``torch.LongTensor``, An index of special blank token.
+    delta : ``torch.FloatTensor``, required.
+        A ``torch.FloatTensor`` for penalizing skip target operators.
+    reduction : ``str``, optional.
+        Specifies the reduction to apply to the output.
+        Default "mean".
+    label_smoothing : ``float``, optional
+        Whether or not to apply label smoothing.
+    return_a : ``bool``, optional.
+        Whether to return the matrix of conditional axe values. Default is False.
+    """
+    
+    assert targets.size(0) == logits.size(0), f'Inconsistency of batch size,  {targets.size(0)} of targets and {logits.size(0)} of logits.'
+
+    batch_size, logits_sequence_length, num_class = logits.shape
+    _, target_sequence_length = targets.shape
+
+    device = logits.device
+    
+    # for torch.gather
+    targets = targets.unsqueeze(-1) # batch_size, target_sequence_length, 1
+
+    # (batch_size, target_sequence_length + 1, logits_sequence_length + 1)
+    batch_A = torch.zeros(targets.size(0), targets.size(1) + 1, logits.size(1) + 1).to(device)
+    batch_blank_index = torch.full((logits.size(0), 1), blank_index, dtype = torch.long).to(device)
+
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    
+    # A_{i,0} = A_{i−1,0} − delta * log P_1 (Y_i)
+    for i in range(1, targets.size(1) + 1):
+        # batch_A[:, i, 0] is calculated from targets[:, i-1, :], because batch_A added 0-th row
+        batch_A[:, i, 0] = batch_A[:, i-1, 0] - delta * torch.gather(log_probs[:, 0, :], dim=1, index=targets[:, i-1, :]).squeeze(-1)
+
+    # A_{0,j} = A_{0,j−1} − log P_j ("BLANK")
+    for j in range(1, logits.size(1) + 1):
+        # batch_A[:, 0, j] is calculated from log_probs[:, j-1, :], because batch_A added 0-th column
+        batch_A[:, 0, j] = batch_A[:, 0, j-1] - delta * torch.gather(log_probs[:, j-1, :], dim=1, index=batch_blank_index).squeeze(-1)
+
+
+    # flip logit dim to get anti-diagonal part by using use torch.diag
+    batch_A_flip = batch_A.flip(-1) # (batch_size, target_sequence_length + 1, logits_sequence_length + 1)
+    log_probs_flip = log_probs.flip(-2) # (batch_size, sequence_length, num_classes)
+
+    # to extract indices for the regions corresponding diag part.
+    map_logits = torch.arange(logits.size(1)) - torch.zeros(targets.size(1), 1)
+    map_targets = torch.arange(targets.size(1)).unsqueeze(-1) - torch.zeros((1, logits.size(1)))
+    # index must be int
+    map_logits = map_logits.long().to(device)
+    map_targets = map_targets.long().to(device)
+
+    for i in range(logits.size(1) - 1, -targets.size(1), -1):
+        
+        
+        # batch_A_flip_sets[:, :, :, 0] : batch_A[:, i  , j-1]
+        # batch_A_flip_sets[:, :, :, 1] : batch_A[:, i-1, j  ]
+        # batch_A_flip_sets[:, :, :, 2] : batch_A[:, i-1, j-1]
+        batch_A_flip_sets = torch.cat((batch_A_flip.roll(shifts=-1, dims=-1).unsqueeze(-1),
+                                       batch_A_flip.roll(shifts= 1, dims=-2).unsqueeze(-1),
+                                       batch_A_flip.roll(shifts=(1, -1), dims=(-2, -1)).unsqueeze(-1)),
+                                       dim = -1)
+        
+        # trimming
+        # - the last column (A_{0,j} = A_{0,j−1} − log P_j ("BLANK")) 
+        # - the first row (A_{i,0} = A_{i−1,0} − delta * log P_1 (Y_i))
+        batch_A_flip_sets_trim = batch_A_flip_sets[:, 1:, :-1, :]
+
+        # extracting anti-diagonal part
+        # (batch, 3, num_diag)
+        A_diag = batch_A_flip_sets_trim.diagonal(offset=i, dim1 = -3, dim2 = -2)
+        
+        # (batch, num_diag, 3)
+        A_diag = A_diag.transpose(-1, -2)
+        num_diag = A_diag.size(1)
+        
+        logit_indices = map_logits.diagonal(offset=i, dim1 = -2, dim2 = -1)
+        # log_probs_diag : (batch, num_diag, num_class)
+        log_probs_flip_diag = log_probs_flip[:, logit_indices[0]:logit_indices[-1]+1, :]
+
+        target_indices = map_targets.diagonal(offset=i, dim1 = -2, dim2 = -1)
+        # targets_diag : (batch, num_diag, num_class)
+        targets_diag = targets[:, target_indices[0]:target_indices[-1]+1, :]
+
+        # align, skip_prediction, skip_target
+        batch_align = A_diag[:, :, 2] - torch.gather(log_probs_flip_diag, dim=2, index=targets_diag).squeeze(-1)
+        batch_skip_prediction = A_diag[:, :, 0] - torch.gather(log_probs_flip_diag, dim=2, index=batch_blank_index.expand(-1, num_diag).unsqueeze(-1)).squeeze(-1)
+        batch_skip_target = A_diag[:, :, 1] - delta * torch.gather(log_probs_flip_diag, dim=2, index=targets_diag).squeeze(-1)
+
+        # (batch_size, num_diag, 3)
+        operations = torch.cat((batch_align.unsqueeze(-1), batch_skip_prediction.unsqueeze(-1), batch_skip_target.unsqueeze(-1)), dim = -1)
+
+        # (batch_size, num_diag)
+        diag_axe = torch.min(operations, dim = -1).values
+        
+        assert logits.size(1) > targets.size(1), "assuming target length < logit length." 
+
+        if i > (logits.size(1) - targets.size(1)):
+            # (batch_size, logits_length, logits_length)
+            # -> (batch_size, targets_length, logits_length)
+            axe = torch.diag_embed(diag_axe, offset=i, dim1=-2, dim2=-1)
+            batch_A_flip[:, 1:, :-1] += axe[:, :targets.size(1), :]
+        elif i > 0:
+            # (batch_size, logits_length, logits_length)
+            # -> (batch_size, targets_length, logits_length)
+            axe = torch.diag_embed(diag_axe, offset=0, dim1=-2, dim2=-1)
+            batch_A_flip[:, 1:, i : i + targets.size(1)] += axe
+        else:
+            axe = torch.diag_embed(diag_axe, offset=i, dim1=-2, dim2=-1)
+            batch_A_flip[:, 1:, :targets.size(1)] += axe
+
+    # recover correct order in logit dim
+    batch_A = batch_A_flip.flip(-1)
+    
+    # rm 0-th row and column
+    _batch_A = batch_A[:, 1:, 1:]
+
+    ## Gather A_nm, avoiding masks
+    # index_m : (batch_size, target_sequence_length, 1)
+    index_m = logit_lengths.unsqueeze(-1).expand(-1, _batch_A.size(1)).unsqueeze(-1).long()
+
+    # gather m-th colmun
+    # batch_A_nm : (batch_size, target_sequence_length, 1)
+    # index_m occors out of bounds for index 
+    batch_A_m = torch.gather(_batch_A, dim=2, index=(index_m - 1))
+    batch_A_m = batch_A_m.squeeze(-1)
+
+    # index_n : (batch_size, 1)
+    index_n = target_lengths.unsqueeze(-1).long()
+    
+    # gather n-th row
+    # batch_A_nm : (batch_size, 1, 1)
+    batch_A_nm = torch.gather(batch_A_m, dim=1, index=(index_n - 1))
+
+    # batch_A_nm : (batch_size)
+    batch_A_nm = batch_A_nm.squeeze(-1)
+
+    if reduction == "mean":
+        axe_nm = batch_A_nm.mean()
+    else:
+        raise NotImplementedError
+    
+    # Refs fairseq nat_loss.
+    # https://github.com/pytorch/fairseq/blob/6f6461b81ac457b381669ebc8ea2d80ea798e53a/fairseq/criterions/nat_loss.py#L70
+    # actuary i'm not sure this is reasonable.
+    if label_smoothing is not None and label_smoothing > 0.0:
+        axe_nm = axe_nm * (1.0-label_smoothing) - log_probs.mean() * label_smoothing
+
+    if return_a:
+        return axe_nm, batch_A.detach()
+    
+    return axe_nm
 
 def rand_projections(embedding_dim, num_samples=50, SD=1.):
     """This function generates `num_samples` random samples from the latent space's unit sphere.
@@ -90,286 +578,3 @@ def sliced_wasserstein_distance(encoded_samples,
     swd = _sliced_wasserstein_distance(encoded_samples, z,
                                        num_projections, p)
     return swd
-
-def get_n_branches(x):
-    if type(x) is int:
-        return x * 2 - 2
-    return len(x) * 2 - 2
-
-def define_padded_vectors(leaves, pad):
-    for leaf in leaves:
-        for l in leaf:
-            if ((l == 0.).long().float().mean() == 1.).item():
-                l[pad] = 1.
-    return leaves
-
-def print_tree(x, transform=lambda x: x, attr='terminal'):
-    nx = [None]
-    def fx(x, nx):
-        if x['left'] == {}:
-            if attr is not None:
-                nx[0] = transform(x[attr])
-            else:
-                nx[0] = transform(x)
-        else:
-            nx[0] = [None]
-            nx += [[None]]
-            fx(x['left'], nx[0])
-            fx(x['right'], nx[1])
-    fx(x, nx)
-    nx = Tree.fromstring(str(nx).replace('(','{').replace(')','}').replace('[','(').replace(']',')').replace('),',')'))
-    nx.pretty_print()
-
-def get_vocab(d, l=0, pad=True):
-    if not pad and l == 0:
-        V = {}
-    elif pad and l == 0:
-        V = { '<pad>': 0 }
-    elif not pad and l > 0:
-        V = { '<unk>': 0 }
-    else:
-        V = { '<pad>': 0, '<unk>': 1}
-    lV = len(V)
-    if type(d[0][0]) is list:
-        vocab = chain(*chain(*d))
-    else:
-        vocab = chain(*d)
-    V.update({w:(ix + lV) for ix,w in enumerate([w for w,f in Counter(vocab).items() if f > l])})
-    rV = {ix:w for w,ix in V.items()}
-    return V, rV
-
-def vocab_encoder(v, x):
-    if '<unk>' in v:
-        if type(x[0]) is str:
-            out = [v['<unk>'] if w not in v else v[w] for w in x]
-            out = torch.LongTensor(out)
-        else:
-            out = [
-                [v['<unk>'] if c not in v else v[c] for c in w]
-                for w in x
-            ]
-            out = [torch.LongTensor(o) for o in out]
-    else:
-        if type(x[0]) is str:
-            out = [v[w] for w in x]
-            out = torch.LongTensor(out)
-        else:
-            out = [
-                [v[c] for c in w]
-                for w in x
-            ]
-            out = [torch.LongTensor(o) for o in out]
-    return out
-
-def shuffle_indices(ixs):
-    random.shuffle(ixs)
-    return ixs
-
-def word_dropout(x, dropout=0.2, max_retries=5):
-    if x.shape[0] < 3:
-        dropout = 0.1
-    retries = 0
-    rw = Bernoulli(1. - dropout).sample(x.shape[:-1])
-
-    while rw.sum().item() == 0. and retries < max_retries:
-        rw = Bernoulli(1. - dropout).sample(x.shape[:-1])
-        retries += 1
-    if retries >= max_retries and rw.sum().item() == 0.:
-        return x
-    rw = rw.unsqueeze(2).repeat(1, 1, x.shape[-1])
-    return rw * x, rw
-
-def decode_leaf(rv, g, x, sz=100):
-    return ''.join([
-        rv[l] for l in 
-        g.get_leaves(g(x, [sz], return_trees=True)[0]).softmax(-1).argmax(-1).tolist()
-    ])
-
-def weight_init(m):
-    if hasattr(m, 'weight'):
-        nn.init.xavier_normal_(m.weight)
-
-
-def batch_indices(ixs, batch_size, n_batches):
-    return [
-        ixs[i*batch_size:i*batch_size+batch_size]
-        for i in range(n_batches)
-    ]
-
-def expected_depth(x, mode='sum'):
-    return torch.FloatTensor([
-        (math.sqrt(s)) if mode != 'sum' else ((math.sqrt(s)) * (s)) # last sigmoid activation on a given branch should be < .5
-        for s in x
-    ])
-
-def random_encodings(batch, embed, sd=1.):
-    return torch.normal(0., sd, (batch, emb))
-
-def inspect_parsed_sentence_helper(_x, E, G, C, selector1, ds, ix, CL=None, output_set=None, act=F.selu, sizes=None):
-    if type(_x) is str:
-        x = ds.vars[selector1]['encoder'](ds.vars[selector1]['preprocessor'](_x))
-    else:
-        x = ds.vars[selector1]['encoder'](_x)
-    x = batch_data([x], 0, C.limit)
-    if sizes is None:
-        sizes = [x.shape[0]]
-    encoding, _ = E(x)
-    tree = G(G.act(encoding.sum(0)), sizes=[C.limit], return_trees=True)[0]
-    leaves = G.get_leaves(tree)
-    leaves = batch_data([leaves], 0, C.limit) #, _ = pad(define_padded_vectors(nn.utils.rnn.pad_sequence([leaves]), 0), torch.zeros((C.limit,1)))
-    leaves = C(leaves, act(encoding), sizes)
-
-    tree = attach_to_leaves(tree, leaves, ds.vars['text'], C.io, G, _x if type(_x) != str else ds.vars[selector1]['preprocessor'](_x))
-    if CL != None and output_set != None:
-        classification, attn_weights = CL(
-            [G.get_states(tree).unsqueeze(1)],
-            act(E.embed(output_set)).unsqueeze(1)
-        )
-        return (tree, attn_weights, classification)
-    return (tree, None, None)
-
-def inspect_parsed_sentence(s, ds, E, G, C, ix, selector, CL=None, output_set=None, sizes=None, print_s=False):
-    tree, weights, classification = inspect_parsed_sentence_helper(s, E, G, C, selector, ds, ix, CL, output_set, sizes=sizes)
-    #print(weights[0].shape)
-    weights = weights[0].squeeze(0).transpose(0,1)
-    if output_set is not None and CL is not None:
-        weights = { ix:w for ix,w in enumerate(weights.argmax(-1).tolist()) }
-        #print(weights)
-        subs = { ix: sub for ix,sub in enumerate(G.get_leaves_from_subtrees(tree, 'attachment', False)) }
-        V = ds.vars['text']['vocab']
-        sents = {(len(V) - V[w] - 1): { 'sent': w } for w in ['negative','neutral','positive']}
-        subtrees = {}
-        for ix, ws in weights.items():
-            subtrees[sents[ix]['sent']] = set([subs[w] if type(subs[w]) is str else ' '.join(subs[w]) for w in ([ws] if type(ws) is int else ws)])
-    print()
-    if print_s:
-        print(s if type(s) is str else ' '.join(s))
-    print_tree(tree, lambda x: x, attr='attachment')
-    if output_set is not None and CL is not None:
-        sent = sents[classification.softmax(-1).argmax(-1).item()]['sent']
-        print(sent, subtrees[sent])
-
-
-def batch_data(x, pad, limit, emb=1, use_pad_var=True):
-    if x[0].dim() == 1:
-        pad_vec = [torch.zeros(limit).long()]
-        x = nn.utils.rnn.pad_sequence(list(x) + pad_vec, padding_value=pad)[:,:-1]
-    else:
-        pad_vec = [torch.zeros((limit, emb))]
-        if use_pad_var:
-            x = define_padded_vectors(nn.utils.rnn.pad_sequence(list(x) + pad_vec), pad)[:,:-1,:]
-        else:
-            x = nn.utils.rnn.pad_sequence(list(x) + pad_vec)[:,:-1,:]
-    return x
-
-
-def attach_to_leaves(tree, leaves, var, io, G, source):
-    leaves = [
-        w if w not in var['reverse_vocab'] else var['reverse_vocab'][w].replace('[','{').replace(']','}')
-        for w in leaves.squeeze(1).softmax(-1).argmax(-1).tolist()
-    ]
-    for leaf_ix, leaf in enumerate(leaves):
-        if type(leaf) != str:
-            a = leaf - io
-            if a < len(source):
-                leaves[leaf_ix] = source[a]
-            else:
-                leaves[leaf_ix] = str(a)
-
-    G.attach_to_leaves(tree, leaves)
-    return tree
-
-class LanguageDataset(Dataset):
-    def __init__(self, config):
-        if 'state_dict' in config:
-            self.load_state_dict(config['state_dict'])
-            return
-        df = config['source']#[[k for k in config['vars'].keys()]
-        df = df[[k for k in config['vars'].keys() if k in df.columns]]
-        reserve = config.get('reserve')
-        unify = config.get('unify')
-        anchor = config.get('anchor')
-        df = df[df[anchor].map(
-            lambda x: len(config['vars'][anchor]['preprocessor'](x)) <= config['len_limit']
-        )].sample(config['sample_size']).reset_index(drop=True)
-        self.test_df = df.iloc[-config['test_size']:]
-        df = df.iloc[:-config['test_size']]
-        self.vars = {}
-        self.sample_size = config['sample_size']
-        self.test_size = config['test_size']
-        if unify:
-            master = {}
-            data = list(chain(*[
-                [
-                    [w for w in s if not (k in reserve and w in reserve[k])]
-                    for s in df[k].map(v['preprocessor']).tolist()
-                ]
-                for k,v in config['vars'].items()
-                if k in unify
-            ]))
-            master_vocab, reverse_master_vocab = get_vocab(
-                pd.Series(data),
-                config['vars'][anchor]['limit'],
-                config['vars'][anchor]['pad']
-            )
-            master_encoder = partial(vocab_encoder, master_vocab)
-             
-        for k,v in config['vars'].items():
-            self.vars[k] = {}
-            if k not in df.columns:
-                data = df[v['source']].map(v['preprocessor'])
-            else:
-                data = df[k].map(v['preprocessor'])
-            self.vars[k]['preprocessor'] = v['preprocessor']
-            self.vars[k]['text'] = data
-            if k in unify:
-                self.vars[k]['vocab'], self.vars[k]['reverse_vocab'] = (master_vocab, reverse_master_vocab)
-                self.vars[k]['encoder'] = master_encoder
-            else:
-                self.vars[k]['vocab'], self.vars[k]['reverse_vocab'] = get_vocab(data, v['limit'], v['pad'])
-                self.vars[k]['encoder'] = partial(vocab_encoder, self.vars[k]['vocab'])
-            self.vars[k]['vectors'] = list(map(self.vars[k]['encoder'], self.vars[k]['text']))
-            if 'extra_fxns' in v:
-                self.vars[k]['extra_fxns'] = v['extra_fxns']
-                for fxn_name, (ref, fxn) in v['extra_fxns'].items():
-                    self.vars[k][fxn_name] = list(map(partial(fxn, self.vars[k]), self.vars[k][ref]))
-    def __len__(self):
-        return len(list(self.vars.values())[0]['vectors'])
-    def __getitem__(self, idx):
-        #return [v['vectors'][idx] for v in self.vars.values()]
-        return { 
-            k: {
-                _k: v[_k][idx]
-                for _k in v.keys()
-                if _k not in ['extra_fxns','vocab','encoder','text','preprocessor','reverse_vocab']
-            }
-            for k,v in self.vars.items()
-        }
-    def state_dict(self):
-        return {
-            k: {
-                _k:_v
-                for _k,_v in v.items()
-                if _k in ['preprocessor','vocab', 'reverse_vocab', 'extra_fxns', 'encoder']
-            }
-            for k,v in self.vars.items()
-        }
-    def load_state_dict(self, state_dict):
-        self.vars = state_dict
-    def preprocess_new_observations(self, var, x, replace_underlying_data=False):
-        out = {}
-        preprocessor = self.vars[var]['preprocessor']
-        encoder = self.vars[var]['encoder']
-        out['text'] = list(map(preprocessor, x))
-        out['vectors'] = list(map(encoder, out['text']))
-        if 'extra_fxns' in self.vars[var]:
-            for fxn_name, (ref, fxn) in self.vars[var]['extra_fxns'].items():
-                out[fxn_name] = list(map(partial(fxn, self.vars[var]), out[ref]))
-        if replace_underlying_data:
-            self.vars[var]['text'] = out['text']
-            self.vars[var]['vectors'] = out['vectors']
-            if 'extra_fxns' in self.vars[var]:
-                for fxn_name, (ref, fxn) in self.vars[var]['extra_fxns'].items():
-                    self.vars[var][fxn_name] = list(map(partial(fxn, self.vars[var]), self.vars[var][ref]))
-            return None
-        return out    
