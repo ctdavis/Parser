@@ -221,8 +221,8 @@ class ResidualGenerator(Generator):
            x, h = x
         h = self.controller(x, h)
         has_branches = self.has_branches(torch.cat([x, h], dim=-1))
-        if self.training:
-            has_branches = has_branches + torch.randn((1, 1))
+        #if self.training:
+        #    has_branches = has_branches + torch.randn((1, 1))
         has_branches = has_branches.sigmoid()
         if has_branches < .5 or self.current_steps >= self.max_steps:
             return {
@@ -281,7 +281,7 @@ class Copy(nn.Module):
         ], dim=-1)
     def forward(self, o, f):
         q = self.selu(self.query1(self.selu(self.query0(o.transpose(0,1).unsqueeze(0)))).transpose(1,2).transpose(0,1))
-        kv = self.discretize(self.selu(self.hidden(self.selu(f)))).unsqueeze(1)
+        kv = self.selu(f).unsqueeze(1) #self.discretize(self.selu(self.hidden(self.selu(f)))).unsqueeze(1)
         ao = self.selu(self.A(q, kv, sizes=[len(f)])[0].squeeze(1))
         out = torch.cat([self.V(ao), self.C(ao)], dim=-1)
         return out
@@ -331,11 +331,39 @@ class Parser(nn.Module):
         self.encoder = CNNEncoder(**kwargs)
         self.decoder = ResidualGenerator(**kwargs)
         self.copy = Copy(**kwargs)
-        self.decoder.hidden.weight.data = self.copy.hidden.weight.data
+        #self.decoder.hidden.weight.data = self.copy.hidden.weight.data
+
         self.encoder.word_encoder.embed.weight.data = self.copy.V.weight.data
         self.encoder.char_encoder.embed.weight.data = self.encoder.char_decoder.V.weight.data
-        #self.encoder.word_encoder.conv0.weight.data = self.copy.query0.weight.data
-        #self.encoder.word_encoder.conv1.weight.data = self.copy.query1.weight.data
+        self.encoder.word_encoder.conv0.weight.data = self.copy.query0.weight.data
+        self.encoder.word_encoder.conv1.weight.data = self.copy.query1.weight.data
+        
+        #######
+        #self.encoder.word_encoder.embed.bias.data = self.copy.V.bias.data
+        #self.encoder.char_encoder.embed.bias.data = self.encoder.char_decoder.V.bias.data
+        self.encoder.word_encoder.conv0.bias.data = self.copy.query0.bias.data
+        self.encoder.word_encoder.conv1.bias.data = self.copy.query1.bias.data
+        
+        # tie word-level and char-level weights where possible
+        self.decoder.hidden.weight.data = self.encoder.char_decoder.hidden.weight.data
+        self.decoder.branch.weight.data = self.encoder.char_decoder.branch.weight.data
+        self.decoder.has_branches.weight.data = self.encoder.char_decoder.has_branches.weight.data
+        self.decoder.controller.weight_ih.data = self.encoder.char_decoder.controller.weight_ih.data
+        self.decoder.controller.weight_hh.data = self.encoder.char_decoder.controller.weight_hh.data
+        
+        self.encoder.char_encoder.conv0.weight.data = self.encoder.word_encoder.conv0.weight.data
+        self.encoder.char_encoder.conv1.weight.data = self.encoder.word_encoder.conv1.weight.data 
+        
+        #######
+        self.decoder.hidden.bias.data = self.encoder.char_decoder.hidden.bias.data
+        self.decoder.branch.bias.data = self.encoder.char_decoder.branch.bias.data
+        self.decoder.has_branches.bias.data = self.encoder.char_decoder.has_branches.bias.data
+        self.decoder.controller.bias_ih.data = self.encoder.char_decoder.controller.bias_ih.data
+        self.decoder.controller.bias_hh.data = self.encoder.char_decoder.controller.bias_hh.data
+        
+        self.encoder.char_encoder.conv0.bias.data = self.encoder.word_encoder.conv0.bias.data
+        self.encoder.char_encoder.conv1.bias.data = self.encoder.word_encoder.conv1.bias.data         
+        
         self._discretize = (lambda x: 0 if x is None else x)(kwargs.get('discretize'))
         self.span_dropout = kwargs.get('span_dropout')
         self.out = wn(nn.Linear(self.h, 2))

@@ -105,7 +105,7 @@ n_sentences = len(data)
 print(f'Size: {n_sentences}, Vocab: {len(ds.vrs["text"]["V"])}')
 
 freq = 100
-kmeans = [KMeans(n_clusters=i, mode='euclidean') for i in range(2, 6)]
+kmeans = [KMeans(n_clusters=i, mode='euclidean') for i in range(2, 4)]
 n_obs = 0
 
 for e in range(n_sentences):
@@ -120,69 +120,48 @@ for e in range(n_sentences):
         epoch_acc = 0.
         epoch_char_loss = 0.
         epoch_char_acc = 0.
+        epoch_ucl = []
+        epoch_uca = []
         examples = []
         epoch_cat = []
+        epoch_con = []
 
-    # update model
-    (recon_loss, depth_loss, swd_loss, acc), (char_loss, char_depth, char_swd, char_acc) = compute_loss_and_acc(
-        P, _d[0], c[0], model_config, ce=ce, mse=mse, discretization=model_config['discretize'], size=len(_d[0]), char_level=True
-    )
-    loss = (recon_loss + depth_loss + swd_loss + char_loss + char_depth + char_swd)
-    #"""
-    if random.choice([True] + [False]): # consistency loss
-        states0 = (lambda x: torch.cat([P.decoder.get_states(x), P.decoder.get_states(x, 'h')], dim=1))(P(_d[0], c[0])['tree'])
-        states1 = (lambda x: torch.cat([P.decoder.get_states(x), P.decoder.get_states(x, 'h')], dim=1))(P(_d[0], c[0])['tree'])
-        if len(states0) < len(states1):
-            states0 = torch.cat([states0, torch.zeros((len(states1) - len(states0), states0.shape[-1]))])
-        elif len(states1) < len(states0):
-            states1 = torch.cat([states1, torch.zeros((len(states0) - len(states1), states1.shape[-1]))])
-        loss += mse(states0, states1)
-    #"""
-    #"""
-    if random.choice([True] + [False] * 4): # clustering loss
-        random_sample = data.sample(50).text.tolist()                    
-        encodings = [
-            st['state']
-            for d_ in random_sample
-            for st in P.decoder.get_subtrees(parse_sentence(d_, ds, P, model_config, _print_tree=False), len(preprocessor(d_)[0]))
-        ]            
+    target = create_target(_d[0], model_config['o'])
+    parse_dict = P(_d[0], c[0], use_wd=model_config['wd'], size=len(_d[0]), gen_chars=True)
 
-        encodings = random.sample(encodings, 50)
-
-        z = torch.cat(encodings).mean(0, keepdim=True)
-        cluster_ids = random.choice(kmeans).fit_predict(torch.cat(encodings).detach())
-        cat_dataset_ = list(zip(encodings, cluster_ids))
-        cat_dataset = []
-        for cat in cluster_ids.unique().tolist():
-            cat_dataset += [(lambda y: [[z[0] for z in y[:-1]], y[-1][0]])(list(filter(lambda x: x[1] == cat, cat_dataset_)))]
-        cat_dataset = list(filter(lambda x: len(x[0]) > 1, cat_dataset))
-        cat_losses = []
-        for support, query in cat_dataset:
-            if random.choice([True, False]):
-                query = random.choice(encodings)
-                target = torch.zeros((1,)).long()
-            else:
-                target = torch.ones((1,)).long()
-            z_dist = -(z - query).pow(2).sum().view(1,1)
-            s_dist = -(torch.cat(support).mean(0, keepdim=True) - query).pow(2).sum().view(1,1)
-            dists = torch.cat([z_dist, s_dist]).view(1,2)
-            cat_losses += [ce(dists, target).view(1,1)]
-        cat_loss = torch.cat(cat_losses).mean() * 1.
-        epoch_cat += [cat_loss.item()]
-        loss += cat_loss
-    #"""
+    wrl = word_reconstruction_loss(parse_dict, target)
+    wdl = word_depth_loss(parse_dict, target, coeff=0.001)
+    wswd = word_swd(parse_dict)
+    wacc = word_accuracy(parse_dict, target)
+    
+    crl = char_reconstruction_loss(parse_dict, c[0])
+    cdl = char_depth_loss(parse_dict, c[0], coeff=0.001)
+    cswd = char_swd(parse_dict)
+    cacc = char_accuracy(parse_dict, c[0])
+    
+    loss = (wrl + wdl + wswd + crl + cdl + cswd)
+    
+    if random.choice([True] + [False] * 3):
+        ucl, uca = unsupervised_clustering_loss(data.text, ds, P, model_config, random.choice(kmeans)) 
+        loss += ucl
+        epoch_ucl += [ucl.item()]
+        epoch_uca += [uca]
+    
     loss.backward()
     opt.step()
     opt.zero_grad()
 
     # record progress
-    epoch_recon += recon_loss.item()
-    epoch_depth += depth_loss.item()
-    epoch_swd += swd_loss.item()
-    epoch_acc += acc
-    epoch_char_loss += char_loss.item()
-    epoch_char_acc += char_acc
-
+    epoch_recon += wrl.item()
+    epoch_depth += wdl.item()
+    epoch_swd += wswd.item()
+    epoch_acc += wacc
+    epoch_char_loss += crl.item()
+    epoch_char_acc += cacc
+    #epoch_ucl += ucl.item()
+    #epoch_uca += uca
+    #epoch_con += [con.item()]
+    
     examples += [[_d, c]]
 
     if e != 0 and e % freq == 0:
@@ -194,11 +173,14 @@ for e in range(n_sentences):
         acc = round(epoch_acc / freq, 2) * 100
         char_loss = round(epoch_char_loss / freq, 3)
         char_acc = round(epoch_char_acc / freq, 2) * 100
-        cl = round(sum(epoch_cat) / len(epoch_cat), 3)
+        ucl = round(sum(epoch_ucl) / len(epoch_ucl), 3)
+        uca = round(sum(epoch_uca) / len(epoch_uca), 2) * 100
+        #cl = 0.#round(sum(epoch_cat) / len(epoch_cat), 3)
+        #con = round(sum(epoch_con) / len(epoch_con), 3)
         
         test_dict = P(_d[0], c[0])
         tree, leaves = test_dict['tree'], test_dict['leaves_after_copy']
-        print(f'epoch: {e // freq} / loss: {recon} / depth: {depth} / swd: {swd} / acc: {acc} / closs: {char_loss} / cacc: {char_acc} / cl: {cl}')
+        print(f'epoch: {e // freq} / loss: {recon} / depth: {depth} / swd: {swd} / acc: {acc} / closs: {char_loss} / cacc: {char_acc} / ucl: {ucl} / uca: {uca}')# / con: {con}')
         print(f'reconstruction of: {" ".join(d[0])}')
         try:
             parse_sentence(" ".join(d[0]), ds, P, model_config)

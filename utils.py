@@ -175,38 +175,101 @@ def preprocessor(x, lower=True):
     x = re.sub(r'(!\?|\?!)+', r'?', x)
     x = re.sub(r'\.{2,}', r'.', x)
     return [remove_extra_space(s.strip()).split(' ') for s in nltk.sent_tokenize(x) if s.strip().split(' ') != [' '] and 'mw - parse' not in s]
-
-def compute_loss_and_acc(P, d, c, model_config, ce=nn.CrossEntropyLoss(), mse=nn.MSELoss(), use_wd=True, size=None, discretization=0, gon=None, char_level=False):
-    t = create_target(d, model_config['o'])
-
-    # forward pass
-    parse_dict = P(d, c, use_wd=use_wd, size=size, gen_chars=char_level)
-
-    # unpack and post process
-    tree = parse_dict['tree']
+    
+def word_reconstruction_loss(parse_dict, target):
     leaves = parse_dict['leaves_after_copy']
+    leaves, target = pad_to_match_length(leaves, target)
+    return axe_recon_loss(leaves, target, 2.) 
+    
+def word_depth_loss(parse_dict, target, mse=nn.MSELoss(), coeff=0.001):
     depth = parse_dict['depths']
+    return mse(depth.sum(0), expected_depth(len(target), mode='sum')) * coeff
+    
+def word_swd(parse_dict):
     states = parse_dict['states']
-    _leaves, t = pad_to_match_length(leaves, t)
+    return sliced_wasserstein_distance(states)
     
-    if char_level:
+def word_accuracy(parse_dict, target):
+    leaves= parse_dict['leaves_after_copy']
+    leaves, target = pad_to_match_length(leaves, target)
+    return accuracy(leaves.detach(), target)
     
-        char_trees = parse_dict['char_trees']
-        char_ce = torch.cat([axe_recon_loss(pad_to_match_length(l['leaves'], _c.transpose(1,2).squeeze(0).argmax(-1))[0],_c.transpose(1,2).squeeze(0).argmax(-1), 2.).view(1, 1) for l,_c in zip(char_trees, c)]).mean(0, keepdim=True)
-        char_depth = torch.cat([mse(l['depths'].sum(0), expected_depth(_c.shape[-1], mode='sum')).view(1,1) * 1. for l,_c in zip(char_trees, c)]).mean(0, keepdim=True)
-        char_swd = torch.cat([sliced_wasserstein_distance(l['states']).view(1,1) * 0.01 for l,_c in zip(char_trees, c)]).mean(0, keepdim=True)#[:,:-discretization]
-        char_acc = [accuracy(pad_to_match_length(l['leaves'], _c.transpose(1,2).squeeze(0).argmax(-1))[0].detach(), _c.transpose(1,2).squeeze(0).argmax(-1)) for l,_c in zip(char_trees, c)]
-
-    # calculate loss and acc
-    recon_loss = axe_recon_loss(_leaves, t, 2.) #ce(_leaves, t) * 1.
-    depth_loss = mse(depth.sum(0), expected_depth(len(d), mode='sum')) * 0.01 # was changed from .0005, where performance was generally very good
-    swd_loss = sliced_wasserstein_distance(states) * 1.#
-    acc = accuracy(_leaves.detach(), t)
+def char_reconstruction_loss(parse_dict, target):
+    char_trees = parse_dict['char_trees']
+    return torch.cat([
+        axe_recon_loss(
+            pad_to_match_length(c['leaves'], t.transpose(1,2).squeeze(0).argmax(-1))[0],
+            t.transpose(1,2).squeeze(0).argmax(-1),
+            2.
+        ).view(1, 1)
+        for c,t in zip(char_trees, target)
+    ]).mean(0, keepdim=True)
     
-    if char_level:
-        return (recon_loss, depth_loss, swd_loss, acc), (char_ce, char_depth, char_swd, sum(char_acc)/len(char_acc))
-
-    return (recon_loss, depth_loss, swd_loss, acc, fm_loss), (0., 0., 0., 0.)
+def char_depth_loss(parse_dict, target, mse=nn.MSELoss(), coeff=0.001):
+    char_trees = parse_dict['char_trees']
+    return torch.cat([
+        mse(
+            c['depths'].sum(0),
+            expected_depth(t.shape[-1], mode='sum')
+        ).view(1,1) * coeff
+        for c,t in zip(char_trees, target)
+    ]).mean(0, keepdim=True)
+    
+def char_swd(parse_dict):
+    char_trees = parse_dict['char_trees']
+    return torch.cat([
+        sliced_wasserstein_distance(c['states']).view(1,1)
+        for c in char_trees
+    ]).mean(0, keepdim=True)
+    
+def char_accuracy(parse_dict, target):
+    char_trees = parse_dict['char_trees']
+    acc = [
+        accuracy(
+            pad_to_match_length(c['leaves'], t.transpose(1,2).squeeze(0).argmax(-1))[0].detach(),
+            t.transpose(1,2).squeeze(0).argmax(-1)
+        )
+        for c,t in zip(char_trees, target)
+    ]
+    return sum(acc)/len(acc)
+    
+def consistency_loss(_d, c, P, mse=nn.MSELoss(), coeff=1.):
+    states0 = (lambda x: P.decoder.get_leaves(x, 'depth'))(P(_d[0], c[0])['tree'])
+    states1 = (lambda x: P.decoder.get_leaves(x, 'depth'))(P(_d[0], c[0])['tree'])        
+    if len(states0) < len(states1):
+        states0 = torch.cat([states0, torch.zeros((len(states1) - len(states0), states0.shape[-1]))])
+    elif len(states1) < len(states0):
+        states1 = torch.cat([states1, torch.zeros((len(states0) - len(states1), states1.shape[-1]))])
+    return mse(states0, states1) * coeff
+    
+def unsupervised_clustering_loss(data, ds, P, model_config, kmeans, sample_size=30, n_shots=3, ce=nn.CrossEntropyLoss()):
+    random_sample = data.sample(sample_size).tolist()
+    encodings = [
+        st['state']
+        for s in random_sample
+        for st in P.decoder.get_subtrees(parse_sentence(s, ds, P, model_config, _print_tree=False), len(preprocessor(s)[0]))
+    ]
+    cluster_ids = kmeans.fit_predict(torch.cat(encodings).detach()).tolist()
+    grouped_encodings = {i:[] for i in set(cluster_ids)}
+    for encoding,i in zip(encodings, cluster_ids):
+        grouped_encodings[i] += [encoding]
+    grouped_encodings = {i:random.sample(es, n_shots) for i,es in grouped_encodings.items() if len(es) >= n_shots}
+    grouped_encodings = {i:es for i,es in enumerate(grouped_encodings.values())}
+    supports = [torch.cat(es[:-1]).mean(0, keepdim=True) for es in grouped_encodings.values()]
+    queries = [es[-1] for es in grouped_encodings.values()]
+    dists = []
+    outputs = []
+    for ix,(support, query) in enumerate(zip(supports, queries)):
+        p_dist = -((support - query).pow(2).sum()).view(1,1)
+        dists = [
+            -((negatives - query).pow(2).sum()).view(1,1)
+            for negatives in [s for i,s in enumerate(supports) if ix != i]
+        ]
+        dists.insert(ix, p_dist)
+        outputs += [[torch.cat(dists, dim=1), torch.LongTensor([ix])]]
+    x, y = zip(*outputs)
+    acc = (torch.cat(x).softmax(-1).argmax(-1) == torch.cat(y)).long().float().mean().item()
+    return ce(torch.cat(x), torch.cat(y)), acc  
 
 class Dataset:
     def __init__(self, config, saved_variables=None):
