@@ -105,7 +105,7 @@ n_sentences = len(data)
 print(f'Size: {n_sentences}, Vocab: {len(ds.vrs["text"]["V"])}')
 
 freq = 100
-kmeans = [KMeans(n_clusters=i, mode='euclidean') for i in range(2, 4)]
+kmeans = [KMeans(n_clusters=i, mode='euclidean') for i in range(2, 6)]
 n_obs = 0
 
 for e in range(n_sentences):
@@ -141,8 +141,10 @@ for e in range(n_sentences):
     
     loss = (wrl + wdl + wswd + crl + cdl + cswd)
     
-    if random.choice([True] + [False] * 3):
-        ucl, uca = unsupervised_clustering_loss(data.text, ds, P, model_config, random.choice(kmeans)) 
+    if False: #random.choice([True] + [False] * 3):
+        n_shots = random.sample(list(range(3, 11)))
+        ucl, uca = unsupervised_clustering_loss(data.text, ds, P, model_config, random.choice(kmeans), sample_size=50, n_shots=n_shots) 
+        ucl = ucl * 0.1
         loss += ucl
         epoch_ucl += [ucl.item()]
         epoch_uca += [uca]
@@ -173,8 +175,11 @@ for e in range(n_sentences):
         acc = round(epoch_acc / freq, 2) * 100
         char_loss = round(epoch_char_loss / freq, 3)
         char_acc = round(epoch_char_acc / freq, 2) * 100
-        ucl = round(sum(epoch_ucl) / len(epoch_ucl), 3)
-        uca = round(sum(epoch_uca) / len(epoch_uca), 2) * 100
+        if epoch_ucl:
+            ucl = round(sum(epoch_ucl) / len(epoch_ucl), 3)
+            uca = round(sum(epoch_uca) / len(epoch_uca), 2) * 100
+        else:
+            ucl, uca = 0., 0.
         #cl = 0.#round(sum(epoch_cat) / len(epoch_cat), 3)
         #con = round(sum(epoch_con) / len(epoch_con), 3)
         

@@ -243,6 +243,10 @@ def consistency_loss(_d, c, P, mse=nn.MSELoss(), coeff=1.):
     return mse(states0, states1) * coeff
     
 def unsupervised_clustering_loss(data, ds, P, model_config, kmeans, sample_size=30, n_shots=3, ce=nn.CrossEntropyLoss()):
+    """
+    uses k-means to cluster subtrees and pushes (n_shots) samples of a given cluster closer together than
+    (n_shots) samples of all encodings (potentially getting samples from the query's cluster) 
+    """
     random_sample = data.sample(sample_size).tolist()
     encodings = [
         st['state']
@@ -261,12 +265,14 @@ def unsupervised_clustering_loss(data, ds, P, model_config, kmeans, sample_size=
     outputs = []
     for ix,(support, query) in enumerate(zip(supports, queries)):
         p_dist = -((support - query).pow(2).sum()).view(1,1)
-        dists = [
-            -((negatives - query).pow(2).sum()).view(1,1)
-            for negatives in [s for i,s in enumerate(supports) if ix != i]
-        ]
-        dists.insert(ix, p_dist)
-        outputs += [[torch.cat(dists, dim=1), torch.LongTensor([ix])]]
+        n_dist = -((torch.cat(random.sample(encodings, n_shots)).mean(0, keepdim=True) - query).pow(2).sum()).view(1,1)
+        outputs += [[torch.cat([p_dist, n_dist], dim=1), torch.LongTensor([0])]]  
+        #dists = [
+        #    -((negatives - query).pow(2).sum()).view(1,1)
+        #    for negatives in [s for i,s in enumerate(supports) if ix != i]
+        #]
+        #dists.insert(ix, p_dist)
+        #outputs += [[torch.cat(dists, dim=1), torch.LongTensor([ix])]]
     x, y = zip(*outputs)
     acc = (torch.cat(x).softmax(-1).argmax(-1) == torch.cat(y)).long().float().mean().item()
     return ce(torch.cat(x), torch.cat(y)), acc  

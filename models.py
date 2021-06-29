@@ -221,8 +221,8 @@ class ResidualGenerator(Generator):
            x, h = x
         h = self.controller(x, h)
         has_branches = self.has_branches(torch.cat([x, h], dim=-1))
-        #if self.training:
-        #    has_branches = has_branches + torch.randn((1, 1))
+        if self.training:
+            has_branches = has_branches + torch.randn((1, 1))
         has_branches = has_branches.sigmoid()
         if has_branches < .5 or self.current_steps >= self.max_steps:
             return {
