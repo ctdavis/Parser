@@ -38,7 +38,7 @@ higher==0.2.1
 httplib2==0.19.1
 idna==2.9
 ipykernel==5.4.3
-ipython==7.14.0
+ipython==7.16.3
 ipython-genutils==0.2.0
 ipywidgets==7.6.3
 jedi==0.17.0
